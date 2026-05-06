@@ -1642,12 +1642,16 @@ void FastFAM::logLREML(const Ref<const VectorXd> pheno, vector<double> &varcomp,
     Eigen::SimplicialLDLT<SpMat> solverV;
     solverV.compute(V);
     if(solverV.info() != Eigen::Success){
-        LOGGER.e(0, "the V matrix is not invertible.");
+        logL = -std::numeric_limits<double>::infinity();
+        return;
     }
 
     VectorXd d = solverV.vectorD();
-    double logdet_V = d.array().log().sum(); 
-    //double logdet_V = solverV.logAbsDeterminant();
+    if(d.minCoeff() <= 0.0){
+        logL = -std::numeric_limits<double>::infinity();
+        return;
+    }
+    double logdet_V = d.array().log().sum();
 
     MatrixXd ViX = solverV.solve(covar); // n*c
 
@@ -1656,7 +1660,10 @@ void FastFAM::logLREML(const Ref<const VectorXd> pheno, vector<double> &varcomp,
     double logdet_XtViX;
     int rank;
     if(!SquareMatrixInverse(XtViX, logdet_XtViX, rank, method)){
-        LOGGER.e(0, "the XtViX matrix is not invertible.");
+        // Grid-search drivers (spREML, spREML_2df) tolerate -inf by skipping
+        // this grid point. See binLogL for the PSD discussion.
+        logL = -std::numeric_limits<double>::infinity();
+        return;
     }
 
     MatrixXd b_proj_t = ViX * XtViX; //n*c
@@ -1716,6 +1723,8 @@ double FastFAM::spREML(const Ref<const SpMat> fam, const Ref<const VectorXd> phe
     vector<double> starts(trails.size());
     vector<double> ends(trails.size());
     vector<double> steps(trails.size());
+    int total_infeasible = 0;
+    int total_points = 0;
 
     bool b_reml = false;
     std::ofstream out;
@@ -1752,13 +1761,27 @@ double FastFAM::spREML(const Ref<const SpMat> fam, const Ref<const VectorXd> phe
         double max_varcomp = 0;
 
         int max_index = 0;
+        int n_infeasible = 0;
         for(int i = 0; i < n_trails; i++){
             double logL = logLs[i];
+            if(!std::isfinite(logL)){
+                n_infeasible++;
+                continue;
+            }
             if(logL > max_logL){
                 max_logL = logL;
                 max_varcomp = varcomps[i];
                 max_index = i;
             }
+        }
+        total_infeasible += n_infeasible;
+        total_points += n_trails;
+
+        if(n_infeasible == n_trails){
+            LOGGER.e(0, "all " + std::to_string(n_trails) + " Vg values in iteration "
+                + std::to_string(iter + 1) + " gave a non-PD V or a singular XtV^-1X over ["
+                + std::to_string(start) + ", " + std::to_string(end) + "]. "
+                "Check for collinear covariates, or try a denser or PSD-regularised GRM.");
         }
         if(max_index == 0){
             start = varcomps[max_index];
@@ -1793,11 +1816,22 @@ double FastFAM::spREML(const Ref<const SpMat> fam, const Ref<const VectorXd> phe
 
         LOGGER << "Iteration " << iter + 1 << ", step size: " << step << ", logL: " << max_logL
                << ". Vg: " << max_varcomp
-               << ", searching range: " << start << " to " << end << std::endl;
+               << ", searching range: " << start << " to " << end;
+        if(n_infeasible > 0){
+            LOGGER << ", infeasible: " << n_infeasible << "/" << n_trails;
+        }
+        LOGGER << std::endl;
     }
 
     if(b_reml){
         out.close();
+    }
+
+    if(total_infeasible > 0){
+        LOGGER << "Grid search skipped " << total_infeasible << "/" << total_points
+               << " Vg values because V was not positive definite or XtV^-1X was singular."
+               << " If the converged Vg lies close to the infeasible region, consider a denser"
+               << " or PSD-regularised GRM." << std::endl;
     }
 
     double Vg = (start + end) / 2.0;
@@ -1896,6 +1930,8 @@ double FastFAM::spREML_2df(const Ref<const SpMat> fam, const Ref<const VectorXd>
     vector<double> starts(trails.size());
     vector<double> ends(trails.size());
     vector<double> steps(trails.size());
+    int total_infeasible = 0;
+    int total_points = 0;
     
     bool b_reml = false;
     std::ofstream out;
@@ -1932,13 +1968,27 @@ double FastFAM::spREML_2df(const Ref<const SpMat> fam, const Ref<const VectorXd>
         double max_varcomp = 0;
         
         int max_index = 0;
+        int n_infeasible = 0;
         for(int i = 0; i < n_trails; i++){
             double logL = logLs[i];
+            if(!std::isfinite(logL)){
+                n_infeasible++;
+                continue;
+            }
             if(logL > max_logL){
                 max_logL = logL;
                 max_varcomp = varcomps[i];
                 max_index = i;
             }
+        }
+        total_infeasible += n_infeasible;
+        total_points += n_trails;
+
+        if(n_infeasible == n_trails){
+            LOGGER.e(0, "all " + std::to_string(n_trails) + " Vg values in iteration "
+                + std::to_string(iter + 1) + " gave a non-PD V or a singular XtV^-1X over ["
+                + std::to_string(start) + ", " + std::to_string(end) + "]. "
+                "Check for collinear covariates, or try a denser or PSD-regularised GRM.");
         }
         if(max_index == 0){
             start = varcomps[max_index];
@@ -1973,11 +2023,22 @@ double FastFAM::spREML_2df(const Ref<const SpMat> fam, const Ref<const VectorXd>
         
         LOGGER << "Iteration " << iter + 1 << ", step size: " << step << ", logL: " << max_logL
         << ". Vg: " << max_varcomp
-        << ", searching range: " << start << " to " << end << std::endl;
+        << ", searching range: " << start << " to " << end;
+        if(n_infeasible > 0){
+            LOGGER << ", infeasible: " << n_infeasible << "/" << n_trails;
+        }
+        LOGGER << std::endl;
     }
     
     if(b_reml){
         out.close();
+    }
+    
+    if(total_infeasible > 0){
+        LOGGER << "Grid search skipped " << total_infeasible << "/" << total_points
+               << " Vg values because V was not positive definite or XtV^-1X was singular."
+               << " If the converged Vg lies close to the infeasible region, consider a denser"
+               << " or PSD-regularised GRM." << std::endl;
     }
     
     double Vg = (start + end) / 2.0;
@@ -3771,25 +3832,37 @@ bool checkNAN(const MatrixXd &mat){
 }
 
 
+// REML log-likelihood at a single tao grid point for fastGWA-BB-REML.
+// Returns -infinity (rather than aborting) when V = W + tao*K is not
+// positive definite or when XtV^-1X is singular: the sparse GRM from
+// --make-bK thresholding can have negative eigenvalues, so some tao
+// values legitimately have no valid log-likelihood. SimplicialLDLT
+// reports Success on indefinite V, so we must also check d.minCoeff().
+// binGridREML already skips non-finite logL values via bEndNAN. A
+// converged tao near the infeasibility boundary may indicate a biased
+// estimate and warrants a denser or PSD-regularised GRM.
 double FastFAM::binLogL(double cur_tao, const SpMat& fam, const SpMat& W, const Ref<VectorXd> Y, const Ref<MatrixXd> X){
     SpMat V = W + cur_tao * fam;
     Eigen::SimplicialLDLT<SpMat> solverV;
     solverV.compute(V);
     if(solverV.info() != Eigen::Success){
-        LOGGER.e(0, "the V matrix is not invertible.");
-    }
-
-    MatrixXd ViX = solverV.solve(X); // n*c
-    if(solverV.info() != Eigen::Success){
-        LOGGER.e(0, "the ViX matrix is not invertible.");
+        return -std::numeric_limits<double>::infinity();
     }
 
     VectorXd d = solverV.vectorD();
-    double logdet_V = d.array().log().sum(); 
+    if(d.minCoeff() <= 0.0){
+        return -std::numeric_limits<double>::infinity();
+    }
+    double logdet_V = d.array().log().sum();
+
+    MatrixXd ViX = solverV.solve(X); // n*c
+    if(solverV.info() != Eigen::Success){
+        return -std::numeric_limits<double>::infinity();
+    }
 
     auto XtVX_solver = (X.transpose() * ViX).colPivHouseholderQr();
     if(!XtVX_solver.isInvertible()){
-        LOGGER.e(0, "the XtViX matrix is not invertible.");
+        return -std::numeric_limits<double>::infinity();
     }
     double logdet_XtVX = XtVX_solver.logAbsDeterminant();
 
@@ -3952,6 +4025,8 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         vector<double> starts(trails.size());
         vector<double> ends(trails.size());
         vector<double> steps(trails.size());
+        int total_infeasible = 0;
+        int total_points = 0;
         
         double start = startTao;
         double end = endTao;
@@ -3973,13 +4048,27 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
             double max_varcomp = 0;
 
             int max_index = 0;
+            int n_infeasible = 0;
             for(int i = 0; i < n_trails; i++){
                 double logL = logLs[i];
+                if(!std::isfinite(logL)){
+                    n_infeasible++;
+                    continue;
+                }
                 if(logL > max_logL){
                     max_logL = logL;
                     max_varcomp = varcomps[i];
                     max_index = i;
                 }
+            }
+            total_infeasible += n_infeasible;
+            total_points += n_trails;
+
+            if(n_infeasible == n_trails){
+                LOGGER.e(0, "all " + std::to_string(n_trails) + " tao values in iteration "
+                    + std::to_string(iter + 1) + " gave a non-PD V matrix over ["
+                    + std::to_string(start) + ", " + std::to_string(end) + "]. "
+                    "The sparse GRM is likely not PSD; try a denser or PSD-regularised GRM.");
             }
             if(max_index == 0){
                 start = varcomps[max_index];
@@ -4014,7 +4103,11 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
 
             LOGGER << "Iteration " << iter + 1 << ", step size: " << step << ", logL: " << max_logL
                 << ". Tao: " << max_varcomp
-                << ", searching range: " << start << " to " << end << std::endl;
+                << ", searching range: " << start << " to " << end;
+            if(n_infeasible > 0){
+                LOGGER << ", infeasible: " << n_infeasible << "/" << n_trails;
+            }
+            LOGGER << std::endl;
             if(b_reml){
                 LOGGER << "\n" << "Upper boundary detail: " << std::endl;
                 LOGGER << "  " << "iter\tstep\tstart\tend\tendNAN" << std::endl;
@@ -4026,6 +4119,11 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
             }
 
 
+        }
+        if(total_infeasible > 0){
+            LOGGER << "Grid search skipped " << total_infeasible << "/" << total_points
+                   << " tao values because V was not positive definite. If the converged tao lies"
+                   << " close to the infeasible region, consider a denser or PSD-regularised GRM." << std::endl;
         }
         cur_tao = (start + end) / 2.0;
         hisTao[curIter] = cur_tao;
