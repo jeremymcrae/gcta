@@ -200,7 +200,6 @@ private:
     struct BinSparseLDLT;
     std::unique_ptr<BinSparseLDLT> binSolverV;
     MatrixXd ViX;
-    MatrixXd inv_XtVX_ViX;
     VectorXd mu;
     VectorXd dWp;
 

@@ -126,6 +126,8 @@ struct FastFAM::BinSparseLDLT {
     vector<int32_t> row_lpos;
 
     Workspace main_ws;
+    vector<double> inv_d_diag_orig;
+    MatrixXd XtVX_inv;
 
     void init(const SpMat &fam) {
         if (fam.rows() != fam.cols()) {
@@ -746,60 +748,75 @@ struct FastFAM::BinSparseLDLT {
         }
     }
 
-    void solveVectorWithMainFactor(const Ref<const VectorXd> &rhs, VectorXd &out, VectorXd &tmp_buf) const {
-        out.resize(n_total);
-        if (n_total == 0) return;
-
-        const double * __restrict src = rhs.data();
-        double * __restrict out_ptr = out.data();
-        const int32_t * __restrict so = s_orig.data();
-        const double * __restrict inv_d_s = main_ws.inv_diag_s.data();
-        for (int32_t s = 0; s < n_s; ++s) {
-            const int32_t idx = so[s];
-            out_ptr[idx] = src[idx] * inv_d_s[s];
+    void prepareGrammarTuning(const Ref<const MatrixXd> &covar_mat, MatrixXd &ViX_out) {
+        solveMatrix(covar_mat, ViX_out, main_ws);
+        MatrixXd XtVX = covar_mat.transpose() * ViX_out;
+        auto XtVX_solver = XtVX.colPivHouseholderQr();
+        if (!XtVX_solver.isInvertible()) {
+            LOGGER.e(0, "XtViX is not invertible.");
         }
+        const Eigen::Index c = covar_mat.cols();
+        XtVX_inv = XtVX_solver.solve(MatrixXd::Identity(c, c));
 
-        if (n > 0) {
-            const int32_t * __restrict rpo = r_perm_orig.data();
-            const double * __restrict inv_diag = main_ws.inv_diag.data();
-            if (main_ws.is_diag_only || nnz_L == 0) {
-                for (int32_t k = 0; k < n; ++k) {
-                    const int32_t idx = rpo[k];
-                    out_ptr[idx] = src[idx] * inv_diag[k];
-                }
-            } else {
-                tmp_buf.resize(n);
-                double * __restrict dst = tmp_buf.data();
-                const int32_t * __restrict lp = Lp.data();
-                const int32_t * __restrict li = Li.data();
-                const double * __restrict Lx = main_ws.Lx.data();
-
-                for (int32_t k = 0; k < n; ++k) {
-                    dst[k] = src[rpo[k]];
-                }
-                for (int32_t i = 0; i < n; ++i) {
-                    const double tmp = dst[i];
-                    if (tmp != 0.0) {
-                        for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
-                            dst[li[p]] -= tmp * Lx[p];
-                        }
-                    }
-                }
-                for (int32_t i = 0; i < n; ++i) {
-                    dst[i] *= inv_diag[i];
-                }
-                for (int32_t i = n - 1; i >= 0; --i) {
-                    double tmp = dst[i];
-                    for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
-                        tmp -= Lx[p] * dst[li[p]];
-                    }
-                    dst[i] = tmp;
-                }
-                for (int32_t k = 0; k < n; ++k) {
-                    out_ptr[rpo[k]] = dst[k];
-                }
+        inv_d_diag_orig.assign(n_total, 0.0);
+        for (int32_t s = 0; s < n_s; ++s) {
+            inv_d_diag_orig[s_orig[s]] = main_ws.inv_diag_s[s];
+        }
+        if (main_ws.is_diag_only || nnz_L == 0) {
+            for (int32_t k = 0; k < n; ++k) {
+                inv_d_diag_orig[r_perm_orig[k]] = main_ws.inv_diag[k];
             }
         }
+    }
+
+    double evalGrammarGamma(const Ref<const VectorXd> &curGeno,
+                            const Ref<const VectorXd> &dWp_vec,
+                            const Ref<const MatrixXd> &ViX_mat,
+                            VectorXd &u_r_buf,
+                            VectorXd &w_buf) const {
+        const double * __restrict g = curGeno.data();
+        const double * __restrict w_p = dWp_vec.data();
+        const double * __restrict inv_ds = inv_d_diag_orig.data();
+
+        double quad_v = 0.0;
+        double denom = 0.0;
+        for (int32_t idx = 0; idx < n_total; ++idx) {
+            const double gi = g[idx];
+            const double gi2 = gi * gi;
+            quad_v += inv_ds[idx] * gi2;
+            denom += w_p[idx] * gi2;
+        }
+
+        if (n > 0 && !main_ws.is_diag_only && nnz_L > 0) {
+            u_r_buf.resize(n);
+            double * __restrict dst = u_r_buf.data();
+            const int32_t * __restrict rpo = r_perm_orig.data();
+            const int32_t * __restrict lp = Lp.data();
+            const int32_t * __restrict li = Li.data();
+            const double * __restrict Lx = main_ws.Lx.data();
+            const double * __restrict inv_diag = main_ws.inv_diag.data();
+
+            for (int32_t k = 0; k < n; ++k) {
+                dst[k] = g[rpo[k]];
+            }
+            for (int32_t i = 0; i < n; ++i) {
+                const double tmp = dst[i];
+                if (tmp != 0.0) {
+                    for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                        dst[li[p]] -= tmp * Lx[p];
+                    }
+                }
+            }
+            double quad_r = 0.0;
+            for (int32_t i = 0; i < n; ++i) {
+                quad_r += inv_diag[i] * dst[i] * dst[i];
+            }
+            quad_v += quad_r;
+        }
+
+        w_buf.noalias() = ViX_mat.transpose() * curGeno;
+        const double proj = w_buf.dot(XtVX_inv * w_buf);
+        return (quad_v - proj) / denom;
     }
 };
 
@@ -2084,7 +2101,13 @@ void FastFAM::conditionCovarReg(VectorXd &y, VectorXd &condPheno){
 }
 
 void FastFAM::conditionCovarBinReg(Eigen::Ref<VectorXd> y){
-    double *Hy = new double[num_indi];
+    double Hy_stack[64];
+    vector<double> Hy_heap;
+    double *Hy = Hy_stack;
+    if (num_covar > 64) {
+        Hy_heap.resize(num_covar);
+        Hy = Hy_heap.data();
+    }
     const char nT = 'N';
     const double a1 = 1.0;
     const double a2 = -1.0;
@@ -2098,7 +2121,6 @@ void FastFAM::conditionCovarBinReg(Eigen::Ref<VectorXd> y){
     dgemv_(&nT, &num_covar, &numi_indi, &a1, H.data(), &num_covar, y.data(), &incr, &b1, Hy, &incr);
     dgemv_(&nT, &numi_indi, &num_covar, &a2, covar.data(), &numi_indi, Hy, &incr, &b2, y.data(), &incr);
 #endif
-    delete[] Hy;
 }
 
 void FastFAM::conditionCovarReg(Eigen::Ref<VectorXd> y){
@@ -5037,14 +5059,9 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         LOGGER.e(0, "can't invert the V matrix.");
     }
 
-    binSolverV->solveMatrix(covar, ViX, binSolverV->main_ws); // n*c
-
-    auto XtVX_solver = (covar.transpose() * ViX).colPivHouseholderQr();
-    if(!XtVX_solver.isInvertible()){
-        LOGGER.e(0, "XtViX is not invertible.");
+    if(!bGLMMExact){
+        binSolverV->prepareGrammarTuning(covar, ViX);
     }
-
-    inv_XtVX_ViX = XtVX_solver.solve(ViX.transpose()); // c*n
     //VectorXd PY = ViY - ViX * est_a;
     //template of P
     //VectorXd PY = solverV.solve(Y) - ViX * inv_XtVX_ViX * Y;
@@ -5122,35 +5139,45 @@ void FastFAM::initBinary(const SpMat &fam){
         LOGGER << "Data for model have been saved to [" << bin_file << "]." << std::endl;
     }
     ViX.resize(0,0);
-    inv_XtVX_ViX.resize(0,0);
     binSolverV.reset();
     //solverV.~SimplicialLDLT<SpMat>();
 }
 
 void FastFAM::binGrammar_func(uintptr_t *genobuf, const vector<uint32_t> &markerIndex){
     int nMarker = markerIndex.size();
+#if defined(OPENBLAS_CONST)
+    int prev_blas_threads = openblas_get_num_threads();
+    openblas_set_num_threads(1);
+#endif
     #pragma omp parallel
     {
-        VectorXd solve_tmp, ViG;
+#if GCTA_CPU_x86
+        mkl_set_num_threads_local(1);
+#endif
+        GenoBufItem item;
+        item.geno.resize(num_indi);
+        VectorXd u_r_buf;
+        VectorXd w_buf(covar.cols());
         #pragma omp for schedule(dynamic)
         for(int i = 0; i < nMarker; i++){
             int index_cur_marker = num_grammar_markers + i;
-            GenoBufItem item;
             item.extractedMarkerIndex = markerIndex[i];
+            item.valid = false;
             geno->getGenoDouble(genobuf, i, &item);
             bValids[index_cur_marker] = item.valid;
             if(item.valid){
                 Map< VectorXd > curGeno(item.geno.data(), num_indi);
                 if(bPreciseCovar) conditionCovarBinReg(curGeno);
-                binSolverV->solveVectorWithMainFactor(curGeno, ViG, solve_tmp);
-                VectorXd PG = ViG - ViX * (inv_XtVX_ViX * curGeno);
-                VectorXd WG = dWp.cwiseProduct(curGeno);
-                double temp_gamma = curGeno.dot(PG) / curGeno.dot(WG);
-
-                v_c_infs[index_cur_marker] = temp_gamma;
+                v_c_infs[index_cur_marker] = binSolverV->evalGrammarGamma(curGeno, dWp, ViX, u_r_buf, w_buf);
             }
         }
+#if GCTA_CPU_x86
+        mkl_set_num_threads_local(0);
+#endif
     }
+#if defined(OPENBLAS_CONST)
+    openblas_set_num_threads(prev_blas_threads);
+#endif
     num_grammar_markers += nMarker;
 }
 
@@ -5262,7 +5289,7 @@ void FastFAM::estBinGamma(){
         o_inf << "CHR\tSNP\tPOS\tA1\tA2\tcinf" << std::endl;
         out_inf = true;
     }
-    for(int i=0; i<num_marker_rand; i++){
+    for(int i=0; i<curNumModel; i++){
         if(bValids[i]){
             if(out_inf){
                 //o_inf << marker->getMarkerStrExtract(marker_index[i]) << "\t" << v_c_infs[i] << std::endl;
