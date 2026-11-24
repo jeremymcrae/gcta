@@ -62,6 +62,116 @@ struct InvItem{
     double val;
 };
 
+struct ScopedSingleThreadBLAS {
+#if defined(OPENBLAS_CONST)
+    int prev_threads;
+    ScopedSingleThreadBLAS() : prev_threads(openblas_get_num_threads()) {
+        openblas_set_num_threads(1);
+    }
+    ~ScopedSingleThreadBLAS() {
+        openblas_set_num_threads(prev_threads);
+    }
+#else
+    ScopedSingleThreadBLAS() {}
+    ~ScopedSingleThreadBLAS() {}
+#endif
+    struct ThreadLocal {
+        ThreadLocal() {
+#if GCTA_CPU_x86
+            mkl_set_num_threads_local(1);
+#endif
+        }
+        ~ThreadLocal() {
+#if GCTA_CPU_x86
+            mkl_set_num_threads_local(0);
+#endif
+        }
+    };
+};
+
+static MatrixXd parallelAtB(const Ref<const MatrixXd> &A, const Ref<const MatrixXd> &B) {
+    const Eigen::Index n_rows = A.rows();
+    const Eigen::Index ca = A.cols();
+    const Eigen::Index cb = B.cols();
+    if (n_rows < 8192) {
+        return A.transpose() * B;
+    }
+    const Eigen::Index kTile = 2048;
+    const Eigen::Index n_tiles = (n_rows + kTile - 1) / kTile;
+    vector<MatrixXd> partials(static_cast<size_t>(n_tiles));
+    ScopedSingleThreadBLAS blas_guard;
+    #pragma omp parallel
+    {
+        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+        #pragma omp for schedule(static)
+        for (Eigen::Index t = 0; t < n_tiles; ++t) {
+            const Eigen::Index r0 = t * kTile;
+            const Eigen::Index rows = std::min<Eigen::Index>(kTile, n_rows - r0);
+            partials[static_cast<size_t>(t)].noalias() =
+                A.middleRows(r0, rows).transpose() * B.middleRows(r0, rows);
+        }
+    }
+    MatrixXd out = MatrixXd::Zero(ca, cb);
+    for (Eigen::Index t = 0; t < n_tiles; ++t) {
+        out.noalias() += partials[static_cast<size_t>(t)];
+    }
+    return out;
+}
+
+static VectorXd parallelAtVec(const Ref<const MatrixXd> &A, const Ref<const VectorXd> &v) {
+    const Eigen::Index n_rows = A.rows();
+    const Eigen::Index ca = A.cols();
+    if (n_rows < 8192) {
+        return A.transpose() * v;
+    }
+    const Eigen::Index kTile = 2048;
+    const Eigen::Index n_tiles = (n_rows + kTile - 1) / kTile;
+    vector<VectorXd> partials(static_cast<size_t>(n_tiles));
+    ScopedSingleThreadBLAS blas_guard;
+    #pragma omp parallel
+    {
+        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+        #pragma omp for schedule(static)
+        for (Eigen::Index t = 0; t < n_tiles; ++t) {
+            const Eigen::Index r0 = t * kTile;
+            const Eigen::Index rows = std::min<Eigen::Index>(kTile, n_rows - r0);
+            partials[static_cast<size_t>(t)].noalias() =
+                A.middleRows(r0, rows).transpose() * v.segment(r0, rows);
+        }
+    }
+    VectorXd out = VectorXd::Zero(ca);
+    for (Eigen::Index t = 0; t < n_tiles; ++t) {
+        out.noalias() += partials[static_cast<size_t>(t)];
+    }
+    return out;
+}
+
+static void updateLogisticWorkingFromEta(const Ref<const VectorXd> &Xa_b,
+                                         const Ref<const VectorXd> &phenoVec,
+                                         VectorXd &mu,
+                                         VectorXd &var_mu_i,
+                                         VectorXd &Y) {
+    const Eigen::Index n = Xa_b.size();
+    mu.resize(n);
+    var_mu_i.resize(n);
+    Y.resize(n);
+    const double * __restrict eta_p = Xa_b.data();
+    const double * __restrict y_obs = phenoVec.data();
+    double * __restrict mu_p = mu.data();
+    double * __restrict v_p = var_mu_i.data();
+    double * __restrict y_wrk = Y.data();
+
+    #pragma omp parallel for schedule(static) if(n >= 4096)
+    for (Eigen::Index i = 0; i < n; ++i) {
+        const double eta = eta_p[i];
+        const double m = 1.0 / (std::exp(-eta) + 1.0);
+        const double v = 1.0 / (m * (1.0 - m));
+        mu_p[i] = m;
+        v_p[i] = v;
+        y_wrk[i] = eta + v * (y_obs[i] - m);
+    }
+}
+
 struct FastFAM::BinSparseLDLT {
     typedef SparseMatrix<double, Eigen::ColMajor, int32_t> SpMat32;
     typedef Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrixXd;
@@ -177,11 +287,6 @@ struct FastFAM::BinSparseLDLT {
         }
         n_s = static_cast<int32_t>(s_orig.size());
         n = static_cast<int32_t>(r_orig.size());
-        if (n_s > 0) {
-            auto mm = std::minmax_element(k_diag_s.begin(), k_diag_s.end());
-            min_k_diag_s = *mm.first;
-            max_k_diag_s = *mm.second;
-        }
         if (n_s > 0) {
             auto mm = std::minmax_element(k_diag_s.begin(), k_diag_s.end());
             min_k_diag_s = *mm.first;
@@ -352,17 +457,25 @@ struct FastFAM::BinSparseLDLT {
         B_s.resize(n_s, m);
         B_r_perm.resize(n, m);
 
-        for (int32_t j = 0; j < n_covar; ++j) {
-            const double * __restrict col_ptr = X.col(j).data();
-            for (int32_t s = 0; s < n_s; ++s) {
-                B_s(s, j) = col_ptr[s_orig[s]];
+        const int32_t * __restrict so = s_orig.data();
+        #pragma omp parallel for schedule(static) if(n_s >= 4096)
+        for (int32_t s = 0; s < n_s; ++s) {
+            const int32_t idx = so[s];
+            for (int32_t j = 0; j < n_covar; ++j) {
+                B_s(s, j) = X(idx, j);
             }
-            for (int32_t k = 0; k < n; ++k) {
-                B_r_perm(k, j) = col_ptr[r_perm_orig[k]];
-            }
+            B_s(s, n_covar) = 0.0;
         }
-        B_s.col(n_covar).setZero();
-        B_r_perm.col(n_covar).setZero();
+
+        const int32_t * __restrict rpo = r_perm_orig.data();
+        #pragma omp parallel for schedule(static) if(n >= 4096)
+        for (int32_t k = 0; k < n; ++k) {
+            const int32_t idx = rpo[k];
+            for (int32_t j = 0; j < n_covar; ++j) {
+                B_r_perm(k, j) = X(idx, j);
+            }
+            B_r_perm(k, n_covar) = 0.0;
+        }
     }
 
     void updateWorkingState(const Ref<const VectorXd> &var_mu_i, const Ref<const VectorXd> &Y,
@@ -372,22 +485,26 @@ struct FastFAM::BinSparseLDLT {
         const double * __restrict y_src = Y.data();
 
         v_s.resize(n_s);
+        double * __restrict vs_dst = v_s.data();
         const int32_t * __restrict so = s_orig.data();
         double cur_min_w = std::numeric_limits<double>::infinity();
+        #pragma omp parallel for schedule(static) reduction(min:cur_min_w) if(n_s >= 4096)
         for (int32_t s = 0; s < n_s; ++s) {
             const int32_t idx = so[s];
             const double wv = w_src[idx];
-            v_s[s] = wv;
+            vs_dst[s] = wv;
             if (wv < cur_min_w) cur_min_w = wv;
             B_s(s, c) = y_src[idx];
         }
         min_w_s = (n_s > 0) ? cur_min_w : 0.0;
 
         v_r_perm.resize(n);
+        double * __restrict vr_dst = v_r_perm.data();
         const int32_t * __restrict rpo = r_perm_orig.data();
+        #pragma omp parallel for schedule(static) if(n >= 4096)
         for (int32_t k = 0; k < n; ++k) {
             const int32_t idx = rpo[k];
-            v_r_perm[k] = w_src[idx];
+            vr_dst[k] = w_src[idx];
             B_r_perm(k, c) = y_src[idx];
         }
     }
@@ -515,15 +632,19 @@ struct FastFAM::BinSparseLDLT {
 
     void permuteWeights(const Ref<const VectorXd> &v_orig, vector<double> &v_s, vector<double> &v_r_perm) const {
         v_s.resize(n_s);
+        double * __restrict vs_dst = v_s.data();
         const double * __restrict src = v_orig.data();
         const int32_t * __restrict so = s_orig.data();
+        #pragma omp parallel for schedule(static) if(n_s >= 4096)
         for (int32_t s = 0; s < n_s; ++s) {
-            v_s[s] = src[so[s]];
+            vs_dst[s] = src[so[s]];
         }
         v_r_perm.resize(n);
+        double * __restrict vr_dst = v_r_perm.data();
         const int32_t * __restrict rpo = r_perm_orig.data();
+        #pragma omp parallel for schedule(static) if(n >= 4096)
         for (int32_t k = 0; k < n; ++k) {
-            v_r_perm[k] = src[rpo[k]];
+            vr_dst[k] = src[rpo[k]];
         }
     }
 
@@ -602,27 +723,51 @@ struct FastFAM::BinSparseLDLT {
             double * __restrict d_s = ws.diag_s.data();
             double * __restrict inv_d_s = ws.inv_diag_s.data();
             const double * __restrict kd_s = k_diag_s.data();
-            if (ws.is_diag_only) {
-                for (int32_t s = 0; s < n_s; ++s) {
-                    const double d = w_s[s];
-                    if (!(d > 0.0)) {
-                        return false;
+            const int32_t kTile = 1024;
+            const int32_t n_tiles = (n_s + kTile - 1) / kTile;
+            vector<double> tile_logs(static_cast<size_t>(n_tiles), 0.0);
+            int any_bad = 0;
+            const bool is_diag = ws.is_diag_only;
+
+            #pragma omp parallel for schedule(static) reduction(|:any_bad) if(n_s >= 4096)
+            for (int32_t t = 0; t < n_tiles; ++t) {
+                const int32_t s0 = t * kTile;
+                const int32_t rows = std::min<int32_t>(kTile, n_s - s0);
+                int local_bad = 0;
+                if (is_diag) {
+                    for (int32_t r = 0; r < rows; ++r) {
+                        const double d = w_s[s0 + r];
+                        if (!(d > 0.0)) {
+                            local_bad = 1;
+                            break;
+                        }
+                        d_s[s0 + r] = d;
+                        inv_d_s[s0 + r] = 1.0 / d;
                     }
-                    d_s[s] = d;
-                    inv_d_s[s] = 1.0 / d;
+                } else {
+                    for (int32_t r = 0; r < rows; ++r) {
+                        const double d = w_s[s0 + r] + cur_tao * kd_s[s0 + r];
+                        if (!(d > 0.0)) {
+                            local_bad = 1;
+                            break;
+                        }
+                        d_s[s0 + r] = d;
+                        inv_d_s[s0 + r] = 1.0 / d;
+                    }
                 }
-            } else {
-                for (int32_t s = 0; s < n_s; ++s) {
-                    const double d = w_s[s] + cur_tao * kd_s[s];
-                    if (!(d > 0.0)) {
-                        return false;
-                    }
-                    d_s[s] = d;
-                    inv_d_s[s] = 1.0 / d;
+                if (local_bad) {
+                    any_bad |= 1;
+                } else {
+                    Map<const Eigen::ArrayXd> ds_blk(d_s + s0, rows);
+                    tile_logs[static_cast<size_t>(t)] = ds_blk.log().sum();
                 }
             }
-            Map<const VectorXd> ds_vec(d_s, n_s);
-            logdet_s = ds_vec.array().log().sum();
+            if (any_bad) {
+                return false;
+            }
+            for (int32_t t = 0; t < n_tiles; ++t) {
+                logdet_s += tile_logs[static_cast<size_t>(t)];
+            }
             if (!std::isfinite(logdet_s)) {
                 return false;
             }
@@ -645,48 +790,52 @@ struct FastFAM::BinSparseLDLT {
         const double * __restrict Lx = ws.Lx.data();
         const double * __restrict inv_diag = ws.inv_diag.data();
 
-        ws.solve_buf.resize(n, 1);
-        double * __restrict dst = ws.solve_buf.data();
+        #pragma omp parallel if(cols > 1 && n_total >= 4096)
+        {
+            vector<double> local_dst((n > 0 && !ws.is_diag_only && nnz_L > 0) ? n : 0);
+            double * __restrict dst = local_dst.data();
 
-        for (Eigen::Index col = 0; col < cols; ++col) {
-            const double * __restrict src = rhs.col(col).data();
-            double * __restrict out_col = out.col(col).data();
+            #pragma omp for schedule(static)
+            for (Eigen::Index col = 0; col < cols; ++col) {
+                const double * __restrict src = rhs.col(col).data();
+                double * __restrict out_col = out.col(col).data();
 
-            for (int32_t s = 0; s < n_s; ++s) {
-                const int32_t idx = so[s];
-                out_col[idx] = src[idx] * inv_d_s[s];
-            }
+                for (int32_t s = 0; s < n_s; ++s) {
+                    const int32_t idx = so[s];
+                    out_col[idx] = src[idx] * inv_d_s[s];
+                }
 
-            if (n > 0) {
-                if (ws.is_diag_only || nnz_L == 0) {
-                    for (int32_t k = 0; k < n; ++k) {
-                        const int32_t idx = rpo[k];
-                        out_col[idx] = src[idx] * inv_diag[k];
-                    }
-                } else {
-                    for (int32_t k = 0; k < n; ++k) {
-                        dst[k] = src[rpo[k]];
-                    }
-                    for (int32_t i = 0; i < n; ++i) {
-                        const double tmp = dst[i];
-                        if (tmp != 0.0) {
-                            for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
-                                dst[li[p]] -= tmp * Lx[p];
+                if (n > 0) {
+                    if (ws.is_diag_only || nnz_L == 0) {
+                        for (int32_t k = 0; k < n; ++k) {
+                            const int32_t idx = rpo[k];
+                            out_col[idx] = src[idx] * inv_diag[k];
+                        }
+                    } else {
+                        for (int32_t k = 0; k < n; ++k) {
+                            dst[k] = src[rpo[k]];
+                        }
+                        for (int32_t i = 0; i < n; ++i) {
+                            const double tmp = dst[i];
+                            if (tmp != 0.0) {
+                                for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                                    dst[li[p]] -= tmp * Lx[p];
+                                }
                             }
                         }
-                    }
-                    for (int32_t i = 0; i < n; ++i) {
-                        dst[i] *= inv_diag[i];
-                    }
-                    for (int32_t i = n - 1; i >= 0; --i) {
-                        double tmp = dst[i];
-                        for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
-                            tmp -= Lx[p] * dst[li[p]];
+                        for (int32_t i = 0; i < n; ++i) {
+                            dst[i] *= inv_diag[i];
                         }
-                        dst[i] = tmp;
-                    }
-                    for (int32_t k = 0; k < n; ++k) {
-                        out_col[rpo[k]] = dst[k];
+                        for (int32_t i = n - 1; i >= 0; --i) {
+                            double tmp = dst[i];
+                            for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                                tmp -= Lx[p] * dst[li[p]];
+                            }
+                            dst[i] = tmp;
+                        }
+                        for (int32_t k = 0; k < n; ++k) {
+                            out_col[rpo[k]] = dst[k];
+                        }
                     }
                 }
             }
@@ -701,6 +850,7 @@ struct FastFAM::BinSparseLDLT {
         double * __restrict out_ptr = out.data();
         const int32_t * __restrict so = s_orig.data();
         const double * __restrict inv_d_s = ws.inv_diag_s.data();
+        #pragma omp parallel for schedule(static) if(n_s >= 4096)
         for (int32_t s = 0; s < n_s; ++s) {
             const int32_t idx = so[s];
             out_ptr[idx] = src[idx] * inv_d_s[s];
@@ -751,7 +901,7 @@ struct FastFAM::BinSparseLDLT {
 
     void prepareGrammarTuning(const Ref<const MatrixXd> &covar_mat, MatrixXd &ViX_out) {
         solveMatrix(covar_mat, ViX_out, main_ws);
-        MatrixXd XtVX = covar_mat.transpose() * ViX_out;
+        MatrixXd XtVX = parallelAtB(covar_mat, ViX_out);
         auto XtVX_solver = XtVX.colPivHouseholderQr();
         if (!XtVX_solver.isInvertible()) {
             LOGGER.e(0, "XtViX is not invertible.");
@@ -760,12 +910,19 @@ struct FastFAM::BinSparseLDLT {
         XtVX_inv = XtVX_solver.solve(MatrixXd::Identity(c, c));
 
         inv_d_diag_orig.assign(n_total, 0.0);
+        double * __restrict inv_d_orig = inv_d_diag_orig.data();
+        const int32_t * __restrict so = s_orig.data();
+        const double * __restrict inv_ds = main_ws.inv_diag_s.data();
+        #pragma omp parallel for schedule(static) if(n_s >= 4096)
         for (int32_t s = 0; s < n_s; ++s) {
-            inv_d_diag_orig[s_orig[s]] = main_ws.inv_diag_s[s];
+            inv_d_orig[so[s]] = inv_ds[s];
         }
         if (main_ws.is_diag_only || nnz_L == 0) {
+            const int32_t * __restrict rpo = r_perm_orig.data();
+            const double * __restrict inv_dr = main_ws.inv_diag.data();
+            #pragma omp parallel for schedule(static) if(n >= 4096)
             for (int32_t k = 0; k < n; ++k) {
-                inv_d_diag_orig[r_perm_orig[k]] = main_ws.inv_diag[k];
+                inv_d_orig[rpo[k]] = inv_dr[k];
             }
         }
     }
@@ -4720,11 +4877,9 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
 
    //init first run
     VectorXd Xa_b = covar * est_a;
-    VectorXd Xa_b_exp = Xa_b.array().exp();
-    mu = Xa_b_exp.array() / (Xa_b_exp.array() + 1);
-    VectorXd var_mu_i = 1.0 / (mu.array() * (-mu.array() + 1));
-    // working vector
-    VectorXd Y = Xa_b.array() + var_mu_i.array() * (phenoVec - mu).array();
+    VectorXd var_mu_i;
+    VectorXd Y;
+    updateLogisticWorkingFromEta(Xa_b, phenoVec, mu, var_mu_i, Y);
     LOGGER << "Initial Var(Y): " << varVector(Y) << std::endl;
     
     double cur_tao = options_d["tao_start"] * varVector(Y); 
@@ -4739,7 +4894,7 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
 
         binSolverV->solveMatrix(covar, ViX, binSolverV->main_ws); // n*c
 
-        auto XtVX_solver = (covar.transpose() * ViX).colPivHouseholderQr();
+        auto XtVX_solver = parallelAtB(covar, ViX).colPivHouseholderQr();
         if(!XtVX_solver.isInvertible()){
             LOGGER.e(0, "the XtViX matrix is not invertible.");
         }
@@ -4747,12 +4902,9 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         VectorXd ViY;
         binSolverV->solveVector(Y, ViY, binSolverV->main_ws);
   
-        est_a = XtVX_solver.solve(ViX.transpose() * Y);
+        est_a = XtVX_solver.solve(parallelAtVec(ViX, Y));
         Xa_b = Y.array() - var_mu_i.array() * (ViY - ViX * est_a).array();
-        Xa_b_exp = Xa_b.array().exp();
-        mu = Xa_b_exp.array() / (Xa_b_exp.array() + 1);
-        var_mu_i = 1.0 / (mu.array() * (-mu.array() + 1));
-        Y = Xa_b.array() + var_mu_i.array() * (phenoVec - mu).array();
+        updateLogisticWorkingFromEta(Xa_b, phenoVec, mu, var_mu_i, Y);
 
         LOGGER << "Initializing with tao: " << cur_tao << ", Var(Y): " << varVector(Y) << cur_tao << ", fixed effects: " << est_a.transpose() << "." << std::endl;
     }
@@ -4792,8 +4944,19 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
 #endif
     const int32_t n_cols_aug = static_cast<int32_t>(covar.cols()) + 1;
     vector<BinSparseLDLT::Workspace> thread_ws(max_omp_threads);
-    for(int t = 0; t < max_omp_threads; ++t){
-        thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
+    {
+        ScopedSingleThreadBLAS blas_guard;
+        #pragma omp parallel num_threads(max_omp_threads)
+        {
+            ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            if (tid < max_omp_threads) {
+                thread_ws[tid].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
+            }
+        }
     }
 
     while(curIter < maxIter && (!bConverge) && numAbTol < 5){
@@ -4899,46 +5062,37 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
 
             const int n_todo = static_cast<int>(todo_indices.size());
             if(n_todo > 0){
-#if defined(OPENBLAS_CONST)
-                int prev_blas_threads = openblas_get_num_threads();
-                openblas_set_num_threads(1);
-#endif
-                #pragma omp parallel
                 {
-                    #pragma omp single
+                    ScopedSingleThreadBLAS blas_guard;
+                    #pragma omp parallel
                     {
+                        #pragma omp single
+                        {
 #ifdef _OPENMP
-                        int active_threads = omp_get_num_threads();
-                        if (active_threads > static_cast<int>(thread_ws.size())) {
-                            int old_sz = static_cast<int>(thread_ws.size());
-                            thread_ws.resize(active_threads);
-                            for (int t = old_sz; t < active_threads; ++t) {
-                                thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
+                            int active_threads = omp_get_num_threads();
+                            if (active_threads > static_cast<int>(thread_ws.size())) {
+                                int old_sz = static_cast<int>(thread_ws.size());
+                                thread_ws.resize(active_threads);
+                                for (int t = old_sz; t < active_threads; ++t) {
+                                    thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
+                                }
                             }
+#endif
                         }
-#endif
-                    }
-#if GCTA_CPU_x86
-                    mkl_set_num_threads_local(1);
-#endif
-                    int tid = 0;
+                        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                        int tid = 0;
 #ifdef _OPENMP
-                    tid = omp_get_thread_num();
+                        tid = omp_get_thread_num();
 #endif
-                    BinSparseLDLT::Workspace &ws = thread_ws[tid];
+                        BinSparseLDLT::Workspace &ws = thread_ws[tid];
 
-                    #pragma omp for schedule(dynamic)
-                    for(int k = 0; k < n_todo; k++){
-                        int i = todo_indices[k];
-                        logLs[i] = binSolverV->evalLogL(w_s.data(), w_r_perm.data(), varcomps[i], ws);
+                        #pragma omp for schedule(dynamic)
+                        for(int k = 0; k < n_todo; k++){
+                            int i = todo_indices[k];
+                            logLs[i] = binSolverV->evalLogL(w_s.data(), w_r_perm.data(), varcomps[i], ws);
+                        }
                     }
-#if GCTA_CPU_x86
-                    mkl_set_num_threads_local(0);
-#endif
                 }
-#if defined(OPENBLAS_CONST)
-                openblas_set_num_threads(prev_blas_threads);
-#endif
                 for(int k = 0; k < n_todo; k++){
                     int i = todo_indices[k];
                     eval_cache.push_back(std::make_pair(varcomps[i], logLs[i]));
@@ -5044,7 +5198,7 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
 
         binSolverV->solveMatrix(covar, ViX, binSolverV->main_ws); // n*c
 
-        auto XtVX_solver = (covar.transpose() * ViX).colPivHouseholderQr();
+        auto XtVX_solver = parallelAtB(covar, ViX).colPivHouseholderQr();
         if(!XtVX_solver.isInvertible()){
             LOGGER.e(0, "XtViX is not invertible.");
         }
@@ -5052,12 +5206,9 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         VectorXd ViY;
         binSolverV->solveVector(Y, ViY, binSolverV->main_ws);
   
-        est_a = XtVX_solver.solve(ViX.transpose() * Y);
+        est_a = XtVX_solver.solve(parallelAtVec(ViX, Y));
         Xa_b = Y.array() - var_mu_i.array() * (ViY - ViX * est_a).array();
-        Xa_b_exp = Xa_b.array().exp();
-        mu = Xa_b_exp.array() / (Xa_b_exp.array() + 1);
-        var_mu_i = 1.0 / (mu.array() * (-mu.array() + 1));
-        Y = Xa_b.array() + var_mu_i.array() * (phenoVec - mu).array();
+        updateLogisticWorkingFromEta(Xa_b, phenoVec, mu, var_mu_i, Y);
         //LOGGER << "Tao value: " << cur_tao << ", Var(Y): " << varVector(Y) << std::endl;
         
         //his_tao[curIter] = cur_tao;
@@ -5088,17 +5239,65 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
     }else{
         LOGGER << "fastGWA-BB-REML converged." << std::endl;
     }
-    // for analysis
-    VectorXd w_glm = 1.0 / var_mu_i.array();
-    MatrixXd XtW = (covar.array().colwise() * w_glm.array()).matrix().transpose();
-    MatrixXd XtWX = XtW * covar;
+    // for analysis: tiled parallel XtWX and H without allocating an N*c XtW matrix
+    const Eigen::Index n_rows_h = covar.rows();
+    const Eigen::Index c_cols = covar.cols();
+    VectorXd w_glm(n_rows_h);
+    {
+        const double * __restrict vm = var_mu_i.data();
+        double * __restrict wg = w_glm.data();
+        #pragma omp parallel for schedule(static) if(n_rows_h >= 4096)
+        for (Eigen::Index i = 0; i < n_rows_h; ++i) {
+            wg[i] = 1.0 / vm[i];
+        }
+    }
+    const Eigen::Index kHTile = 1024;
+    const Eigen::Index n_h_tiles = (n_rows_h + kHTile - 1) / kHTile;
+    vector<MatrixXd> xtwx_partials(static_cast<size_t>(n_h_tiles));
+    {
+        ScopedSingleThreadBLAS blas_guard;
+        #pragma omp parallel if(n_rows_h >= 4096)
+        {
+            ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+            MatrixXd scaled_blk(std::min<Eigen::Index>(kHTile, n_rows_h), c_cols);
+            #pragma omp for schedule(static)
+            for (Eigen::Index t = 0; t < n_h_tiles; ++t) {
+                const Eigen::Index r0 = t * kHTile;
+                const Eigen::Index rows = std::min<Eigen::Index>(kHTile, n_rows_h - r0);
+                auto X_blk = covar.middleRows(r0, rows);
+                auto S_blk = scaled_blk.topRows(rows);
+                S_blk = X_blk.array().colwise() * w_glm.segment(r0, rows).array();
+                xtwx_partials[static_cast<size_t>(t)].noalias() = X_blk.transpose() * S_blk;
+            }
+        }
+    }
+    MatrixXd XtWX = MatrixXd::Zero(c_cols, c_cols);
+    for (Eigen::Index t = 0; t < n_h_tiles; ++t) {
+        XtWX.noalias() += xtwx_partials[static_cast<size_t>(t)];
+    }
     auto t_solver = XtWX.colPivHouseholderQr();
     if(!t_solver.isInvertible()){
         LOGGER.e(0, "XtWX is not invertible.");
     }
-    const Eigen::Index c_cols = covar.cols();
     MatrixXd inv_XtWX = t_solver.solve(MatrixXd::Identity(c_cols, c_cols));
-    H.noalias() = inv_XtWX * XtW;
+    H.resize(c_cols, n_rows_h);
+    {
+        ScopedSingleThreadBLAS blas_guard;
+        #pragma omp parallel if(n_rows_h >= 4096)
+        {
+            ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+            MatrixXd xtw_blk(c_cols, std::min<Eigen::Index>(kHTile, n_rows_h));
+            #pragma omp for schedule(static)
+            for (Eigen::Index t = 0; t < n_h_tiles; ++t) {
+                const Eigen::Index r0 = t * kHTile;
+                const Eigen::Index rows = std::min<Eigen::Index>(kHTile, n_rows_h - r0);
+                auto X_blk = covar.middleRows(r0, rows);
+                auto W_blk = xtw_blk.leftCols(rows);
+                W_blk = (X_blk.array().colwise() * w_glm.segment(r0, rows).array()).matrix().transpose();
+                H.middleCols(r0, rows).noalias() = inv_XtWX * W_blk;
+            }
+        }
+    }
 
     // for 
     binSolverV->permuteWeights(var_mu_i, w_s, w_r_perm);
@@ -5194,15 +5393,10 @@ void FastFAM::initBinary(const SpMat &fam){
 
 void FastFAM::binGrammar_func(uintptr_t *genobuf, const vector<uint32_t> &markerIndex){
     int nMarker = markerIndex.size();
-#if defined(OPENBLAS_CONST)
-    int prev_blas_threads = openblas_get_num_threads();
-    openblas_set_num_threads(1);
-#endif
+    ScopedSingleThreadBLAS blas_guard;
     #pragma omp parallel
     {
-#if GCTA_CPU_x86
-        mkl_set_num_threads_local(1);
-#endif
+        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
         GenoBufItem item;
         item.geno.resize(num_indi);
         VectorXd u_r_buf;
@@ -5220,13 +5414,7 @@ void FastFAM::binGrammar_func(uintptr_t *genobuf, const vector<uint32_t> &marker
                 v_c_infs[index_cur_marker] = binSolverV->evalGrammarGamma(curGeno, dWp, ViX, u_r_buf, w_buf);
             }
         }
-#if GCTA_CPU_x86
-        mkl_set_num_threads_local(0);
-#endif
     }
-#if defined(OPENBLAS_CONST)
-    openblas_set_num_threads(prev_blas_threads);
-#endif
     num_grammar_markers += nMarker;
 }
 
