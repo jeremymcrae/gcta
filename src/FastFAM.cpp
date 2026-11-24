@@ -62,6 +62,9 @@ struct InvItem{
 
 struct FastFAM::BinSparseLDLT {
     typedef SparseMatrix<double, Eigen::ColMajor, int32_t> SpMat32;
+    typedef Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrixXd;
+
+    enum : int32_t { kGramTileRows = 256 };
 
     struct Workspace {
         vector<double> diag_s;
@@ -70,17 +73,25 @@ struct FastFAM::BinSparseLDLT {
         vector<double> diag;
         vector<double> inv_diag;
         vector<double> y;
+        RowMatrixXd U_r;
+        RowMatrixXd scaled_tile;
+        MatrixXd G;
+        MatrixXd XtVX;
         MatrixXd solve_buf;
-        MatrixXd ViX;
-        VectorXd ViY;
 
-        void init(int32_t n_s, int32_t n_r, int32_t nnz_L) {
+        void init(int32_t n_s, int32_t n_r, int32_t nnz_L, int32_t n_cols_aug = 0) {
             diag_s.assign(n_s, 0.0);
             inv_diag_s.assign(n_s, 0.0);
             Lx.assign(nnz_L, 0.0);
             diag.assign(n_r, 0.0);
             inv_diag.assign(n_r, 0.0);
             y.assign(n_r, 0.0);
+            if (n_cols_aug > 0) {
+                U_r.resize(n_r, n_cols_aug);
+                scaled_tile.resize(kGramTileRows, n_cols_aug);
+                G.resize(n_cols_aug, n_cols_aug);
+                XtVX.resize(n_cols_aug - 1, n_cols_aug - 1);
+            }
         }
     };
 
@@ -88,10 +99,15 @@ struct FastFAM::BinSparseLDLT {
     int32_t n_s = 0;
     int32_t n = 0; // number of related individuals (n_r)
     int32_t nnz_L = 0;
+    int32_t n_covar = 0;
 
     vector<int32_t> s_orig;
     vector<double> k_diag_s;
     vector<int32_t> r_perm_orig;
+
+    // Pre-gathered design + working response [X, Y] in row-major layout for singletons and permuted relateds
+    RowMatrixXd B_s;
+    RowMatrixXd B_r_perm;
 
     vector<int32_t> ap_col_ptr;
     vector<int32_t> ap_row_idx;
@@ -310,6 +326,114 @@ struct FastFAM::BinSparseLDLT {
         row_ptr[n] = r_cursor;
 
         main_ws.init(n_s, n, nnz_L);
+    }
+
+    void prepareDesign(const Ref<const MatrixXd> &X) {
+        n_covar = static_cast<int32_t>(X.cols());
+        const int32_t m = n_covar + 1;
+        B_s.resize(n_s, m);
+        B_r_perm.resize(n, m);
+
+        for (int32_t j = 0; j < n_covar; ++j) {
+            const double * __restrict col_ptr = X.col(j).data();
+            for (int32_t s = 0; s < n_s; ++s) {
+                B_s(s, j) = col_ptr[s_orig[s]];
+            }
+            for (int32_t k = 0; k < n; ++k) {
+                B_r_perm(k, j) = col_ptr[r_perm_orig[k]];
+            }
+        }
+        B_s.col(n_covar).setZero();
+        B_r_perm.col(n_covar).setZero();
+    }
+
+    void updateWorkingState(const Ref<const VectorXd> &var_mu_i, const Ref<const VectorXd> &Y,
+                            vector<double> &v_s, vector<double> &v_r_perm) {
+        const int32_t c = n_covar;
+        const double * __restrict w_src = var_mu_i.data();
+        const double * __restrict y_src = Y.data();
+
+        v_s.resize(n_s);
+        const int32_t * __restrict so = s_orig.data();
+        for (int32_t s = 0; s < n_s; ++s) {
+            const int32_t idx = so[s];
+            v_s[s] = w_src[idx];
+            B_s(s, c) = y_src[idx];
+        }
+
+        v_r_perm.resize(n);
+        const int32_t * __restrict rpo = r_perm_orig.data();
+        for (int32_t k = 0; k < n; ++k) {
+            const int32_t idx = rpo[k];
+            v_r_perm[k] = w_src[idx];
+            B_r_perm(k, c) = y_src[idx];
+        }
+    }
+
+    static void accumulateWeightedGram(const RowMatrixXd &B, const double * __restrict inv_d,
+                                       int32_t n_rows, int32_t m,
+                                       RowMatrixXd &scaled_tile, MatrixXd &G) {
+        for (int32_t r0 = 0; r0 < n_rows; r0 += kGramTileRows) {
+            const int32_t rows = std::min<int32_t>(kGramTileRows, n_rows - r0);
+            auto B_blk = B.middleRows(r0, rows);
+            auto S_blk = scaled_tile.topRows(rows);
+            for (int32_t r = 0; r < rows; ++r) {
+                S_blk.row(r) = inv_d[r0 + r] * B_blk.row(r);
+            }
+            G.noalias() += B_blk.transpose() * S_blk;
+        }
+    }
+
+    double evalLogL(const double * __restrict w_s, const double * __restrict w_r_perm,
+                    double cur_tao, Workspace &ws) const {
+        double logdet_V = 0.0;
+        if (!factorize(w_s, w_r_perm, cur_tao, ws, logdet_V)) {
+            return -std::numeric_limits<double>::infinity();
+        }
+
+        const int32_t c = n_covar;
+        const int32_t m = c + 1;
+        ws.G.setZero(m, m);
+
+        if (n_s > 0) {
+            accumulateWeightedGram(B_s, ws.inv_diag_s.data(), n_s, m, ws.scaled_tile, ws.G);
+        }
+
+        if (n > 0) {
+            ws.U_r = B_r_perm;
+            if (nnz_L > 0) {
+                const int32_t * __restrict lp = Lp.data();
+                const int32_t * __restrict li = Li.data();
+                const double * __restrict Lx = ws.Lx.data();
+                double * __restrict u_data = ws.U_r.data();
+                for (int32_t i = 0; i < n; ++i) {
+                    const int32_t p_start = lp[i];
+                    const int32_t p_end = lp[i + 1];
+                    if (p_start == p_end) continue;
+                    const double * __restrict u_i = u_data + static_cast<size_t>(i) * m;
+                    for (int32_t p = p_start; p < p_end; ++p) {
+                        const double l_val = Lx[p];
+                        double * __restrict u_dst = u_data + static_cast<size_t>(li[p]) * m;
+                        for (int32_t col = 0; col < m; ++col) {
+                            u_dst[col] -= l_val * u_i[col];
+                        }
+                    }
+                }
+            }
+            accumulateWeightedGram(ws.U_r, ws.inv_diag.data(), n, m, ws.scaled_tile, ws.G);
+        }
+
+        ws.XtVX = ws.G.topLeftCorner(c, c);
+        Eigen::ColPivHouseholderQR<MatrixXd> XtVX_solver(ws.XtVX);
+        if (!XtVX_solver.isInvertible()) {
+            return -std::numeric_limits<double>::infinity();
+        }
+        const double logdet_XtVX = XtVX_solver.logAbsDeterminant();
+        const VectorXd XtVY = ws.G.block(0, c, c, 1);
+        const VectorXd beta_hat = XtVX_solver.solve(XtVY);
+        const double yPy = ws.G(c, c) - XtVY.dot(beta_hat);
+
+        return -0.5 * (logdet_V + logdet_XtVX + yPy);
     }
 
     void permuteWeights(const Ref<const VectorXd> &v_orig, vector<double> &v_s, vector<double> &v_r_perm) const {
@@ -4391,10 +4515,8 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
 
     binSolverV.reset(new BinSparseLDLT());
     binSolverV->init(fam);
+    binSolverV->prepareDesign(covar);
     vector<double> w_s, w_r_perm;
-
-    SpMat W(num_indi, num_indi);
-    W.setIdentity();
 
    //init first run
     VectorXd Xa_b = covar * est_a;
@@ -4422,11 +4544,10 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
             LOGGER.e(0, "the XtViX matrix is not invertible.");
         }
 
-        inv_XtVX_ViX = XtVX_solver.solve(ViX.transpose()); // c*n
         VectorXd ViY;
         binSolverV->solveVector(Y, ViY, binSolverV->main_ws);
   
-        est_a = inv_XtVX_ViX * Y;
+        est_a = XtVX_solver.solve(ViX.transpose() * Y);
         Xa_b = Y.array() - var_mu_i.array() * (ViY - ViX * est_a).array();
         Xa_b_exp = Xa_b.array().exp();
         mu = Xa_b_exp.array() / (Xa_b_exp.array() + 1);
@@ -4469,16 +4590,17 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
 #ifdef _OPENMP
     max_omp_threads = std::max(1, omp_get_max_threads());
 #endif
+    const int32_t n_cols_aug = static_cast<int32_t>(covar.cols()) + 1;
     vector<BinSparseLDLT::Workspace> thread_ws(max_omp_threads);
     for(int t = 0; t < max_omp_threads; ++t){
-        thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L);
+        thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
     }
 
     while(curIter < maxIter && (!bConverge) && numAbTol < 5){
         LOGGER << "------------------------------------" << std::endl;
         double pre_tao = cur_tao;
         VectorXd pre_est_a = est_a;
-        binSolverV->permuteWeights(var_mu_i, w_s, w_r_perm);
+        binSolverV->updateWorkingState(var_mu_i, Y, w_s, w_r_perm);
 
         double varY = varVector(Y);
         //double MAX_Vg = Vp * options_d["h2_limit"];
@@ -4570,7 +4692,7 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
                         int old_sz = static_cast<int>(thread_ws.size());
                         thread_ws.resize(active_threads);
                         for (int t = old_sz; t < active_threads; ++t) {
-                            thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L);
+                            thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
                         }
                     }
 #endif
@@ -4588,22 +4710,7 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
                 for(int i = 0; i < n_trails; i++){
                     double temp_tao = start + i * step;
                     varcomps[i] = temp_tao;
-                    double logdet_V = 0.0;
-                    if(!binSolverV->factorize(w_s.data(), w_r_perm.data(), temp_tao, ws, logdet_V)){
-                        logLs[i] = -std::numeric_limits<double>::infinity();
-                        continue;
-                    }
-                    binSolverV->solveMatrix(covar, ws.ViX, ws);
-                    auto XtVX_solver = (covar.transpose() * ws.ViX).colPivHouseholderQr();
-                    if(!XtVX_solver.isInvertible()){
-                        logLs[i] = -std::numeric_limits<double>::infinity();
-                        continue;
-                    }
-                    double logdet_XtVX = XtVX_solver.logAbsDeterminant();
-                    MatrixXd local_inv_XtVX_ViX = XtVX_solver.solve(ws.ViX.transpose());
-                    binSolverV->solveVector(Y, ws.ViY, ws);
-                    VectorXd PY = ws.ViY - ws.ViX * (local_inv_XtVX_ViX * Y);
-                    logLs[i] = -0.5 * (logdet_V + logdet_XtVX + Y.dot(PY));
+                    logLs[i] = binSolverV->evalLogL(w_s.data(), w_r_perm.data(), temp_tao, ws);
                 }
 #if GCTA_CPU_x86
                 mkl_set_num_threads_local(0);
@@ -4713,11 +4820,10 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
             LOGGER.e(0, "XtViX is not invertible.");
         }
 
-        inv_XtVX_ViX = XtVX_solver.solve(ViX.transpose()); // c*n
         VectorXd ViY;
         binSolverV->solveVector(Y, ViY, binSolverV->main_ws);
   
-        est_a = inv_XtVX_ViX * Y;
+        est_a = XtVX_solver.solve(ViX.transpose() * Y);
         Xa_b = Y.array() - var_mu_i.array() * (ViY - ViX * est_a).array();
         Xa_b_exp = Xa_b.array().exp();
         mu = Xa_b_exp.array() / (Xa_b_exp.array() + 1);
@@ -4754,14 +4860,16 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         LOGGER << "fastGWA-BB-REML converged." << std::endl;
     }
     // for analysis
-    W.diagonal() = 1.0 / var_mu_i.array();
-    MatrixXd XtW = covar.transpose() * W;
+    VectorXd w_glm = 1.0 / var_mu_i.array();
+    MatrixXd XtW = (covar.array().colwise() * w_glm.array()).matrix().transpose();
     MatrixXd XtWX = XtW * covar;
     auto t_solver = XtWX.colPivHouseholderQr();
     if(!t_solver.isInvertible()){
         LOGGER.e(0, "XtWX is not invertible.");
     }
-    H = t_solver.solve(XtW);
+    const Eigen::Index c_cols = covar.cols();
+    MatrixXd inv_XtWX = t_solver.solve(MatrixXd::Identity(c_cols, c_cols));
+    H.noalias() = inv_XtWX * XtW;
 
     // for 
     binSolverV->permuteWeights(var_mu_i, w_s, w_r_perm);
