@@ -27,6 +27,7 @@
 #include "Eigen/Dense"
 #include "Eigen/Sparse"
 #include <vector>
+#include <memory>
 #include <mutex>
 #include <omp.h>
 
@@ -196,7 +197,8 @@ private:
  
     static bool covarGLM(const VectorXd& phenoVec, const MatrixXd& covar, Ref<VectorXd> est_beta, int maxIter=200, double thresh = 1e-6);
     void initBinary(const SpMat &fam);
-    Eigen::SimplicialLDLT<SpMat> solverV;
+    struct BinSparseLDLT;
+    std::unique_ptr<BinSparseLDLT> binSolverV;
     MatrixXd ViX;
     MatrixXd inv_XtVX_ViX;
     VectorXd mu;

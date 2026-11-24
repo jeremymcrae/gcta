@@ -21,6 +21,7 @@
 #include <cmath>
 #include <algorithm>
 #include <Eigen/SparseCholesky>
+#include <Eigen/OrderingMethods>
 
 #if GCTA_CPU_x86
 #include <Eigen/PardisoSupport>
@@ -57,6 +58,394 @@ struct InvItem{
     int32_t row;
     int32_t col;
     double val;
+};
+
+struct FastFAM::BinSparseLDLT {
+    typedef SparseMatrix<double, Eigen::ColMajor, int32_t> SpMat32;
+
+    struct Workspace {
+        vector<double> Lx;
+        vector<double> diag;
+        vector<double> inv_diag;
+        vector<double> y;
+        MatrixXd solve_buf;
+        MatrixXd ViX;
+        VectorXd ViY;
+
+        void init(int32_t n, int32_t nnz_L) {
+            Lx.assign(nnz_L, 0.0);
+            diag.assign(n, 0.0);
+            inv_diag.assign(n, 0.0);
+            y.assign(n, 0.0);
+        }
+    };
+
+    int32_t n = 0;
+    int32_t nnz_L = 0;
+    vector<int32_t> perm_inv;
+    vector<int32_t> ap_col_ptr;
+    vector<int32_t> ap_row_idx;
+    vector<double> ap_val;
+    vector<double> ap_diag;
+
+    vector<int32_t> Lp;
+    vector<int32_t> Li;
+    vector<int32_t> row_ptr;
+    vector<int32_t> row_col;
+    vector<int32_t> row_lpos;
+
+    Workspace main_ws;
+
+    void init(const SpMat &fam) {
+        if (fam.rows() != fam.cols()) {
+            LOGGER.e(0, "the sparse GRM matrix must be square.");
+        }
+        if (fam.rows() >= std::numeric_limits<int32_t>::max() ||
+            fam.nonZeros() + fam.rows() >= std::numeric_limits<int32_t>::max()) {
+            LOGGER.e(0, "the sparse GRM exceeds 32-bit index capacity.");
+        }
+        n = static_cast<int32_t>(fam.rows());
+        if (n == 0) {
+            nnz_L = 0;
+            return;
+        }
+
+        // Build 32-bit sparse matrix with all diagonal entries structurally present,
+        // matching the exact graph of V = W + cur_tao * fam.
+        SpMat32 fam32(n, n);
+        vector<int32_t> col_counts(n, 0);
+        for (int32_t j = 0; j < n; ++j) {
+            bool has_diag = false;
+            for (SpMat::InnerIterator it(fam, j); it; ++it) {
+                if (it.index() == j) has_diag = true;
+                col_counts[j]++;
+            }
+            if (!has_diag) col_counts[j]++;
+        }
+        fam32.reserve(col_counts);
+        for (int32_t j = 0; j < n; ++j) {
+            bool inserted_diag = false;
+            for (SpMat::InnerIterator it(fam, j); it; ++it) {
+                int32_t r = static_cast<int32_t>(it.index());
+                if (!inserted_diag && r > j) {
+                    fam32.insertBackUncompressed(j, j) = 0.0;
+                    inserted_diag = true;
+                }
+                if (r == j) inserted_diag = true;
+                fam32.insertBackUncompressed(r, j) = it.value();
+            }
+            if (!inserted_diag) {
+                fam32.insertBackUncompressed(j, j) = 0.0;
+            }
+        }
+        fam32.finalize();
+        fam32.makeCompressed();
+
+        Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int32_t> Pinv, P;
+        {
+            SpMat32 C;
+            C = fam32.selfadjointView<Eigen::Lower>();
+            Eigen::AMDOrdering<int32_t> ordering;
+            ordering(C, Pinv);
+        }
+
+        SpMat32 ap(n, n);
+        perm_inv.resize(n);
+        if (Pinv.size() > 0) {
+            P = Pinv.inverse();
+            for (int32_t k = 0; k < n; ++k) {
+                perm_inv[k] = Pinv.indices()[k];
+            }
+            ap.selfadjointView<Eigen::Upper>() = fam32.selfadjointView<Eigen::Lower>().twistedBy(P);
+        } else {
+            for (int32_t k = 0; k < n; ++k) {
+                perm_inv[k] = k;
+            }
+            ap.selfadjointView<Eigen::Upper>() = fam32.selfadjointView<Eigen::Lower>();
+        }
+        ap.makeCompressed();
+
+        ap_col_ptr.assign(n + 1, 0);
+        ap_diag.assign(n, 0.0);
+        ap_row_idx.clear();
+        ap_val.clear();
+        ap_row_idx.reserve(ap.nonZeros());
+        ap_val.reserve(ap.nonZeros());
+
+        for (int32_t k = 0; k < n; ++k) {
+            ap_col_ptr[k] = static_cast<int32_t>(ap_row_idx.size());
+            for (SpMat32::InnerIterator it(ap, k); it; ++it) {
+                int32_t i = it.index();
+                if (i < k) {
+                    ap_row_idx.push_back(i);
+                    ap_val.push_back(it.value());
+                } else if (i == k) {
+                    ap_diag[k] += it.value();
+                }
+            }
+        }
+        ap_col_ptr[n] = static_cast<int32_t>(ap_row_idx.size());
+
+        // Symbolic elimination tree and column counts of L
+        vector<int32_t> parent(n, -1);
+        vector<int32_t> tags(n, -1);
+        vector<int32_t> nz_per_col(n, 0);
+        for (int32_t k = 0; k < n; ++k) {
+            parent[k] = -1;
+            tags[k] = k;
+            nz_per_col[k] = 0;
+            for (int32_t idx = ap_col_ptr[k]; idx < ap_col_ptr[k + 1]; ++idx) {
+                int32_t i = ap_row_idx[idx];
+                for (; tags[i] != k; i = parent[i]) {
+                    if (parent[i] == -1) parent[i] = k;
+                    nz_per_col[i]++;
+                    tags[i] = k;
+                }
+            }
+        }
+
+        Lp.resize(n + 1, 0);
+        int64_t total_nnz = 0;
+        for (int32_t k = 0; k < n; ++k) {
+            Lp[k] = static_cast<int32_t>(total_nnz);
+            total_nnz += nz_per_col[k];
+            if (total_nnz >= std::numeric_limits<int32_t>::max()) {
+                LOGGER.e(0, "Cholesky factor nonzeros exceed 32-bit index capacity.");
+            }
+        }
+        nnz_L = static_cast<int32_t>(total_nnz);
+        Lp[n] = nnz_L;
+
+        // Precompute immutable Li and row-wise topological elimination schedule
+        Li.resize(nnz_L);
+        row_ptr.resize(n + 1, 0);
+        row_col.resize(nnz_L);
+        row_lpos.resize(nnz_L);
+
+        vector<int32_t> pattern(n, 0);
+        std::fill(tags.begin(), tags.end(), -1);
+        std::fill(nz_per_col.begin(), nz_per_col.end(), 0);
+        int32_t r_cursor = 0;
+        for (int32_t k = 0; k < n; ++k) {
+            row_ptr[k] = r_cursor;
+            int32_t top = n;
+            tags[k] = k;
+            for (int32_t idx = ap_col_ptr[k]; idx < ap_col_ptr[k + 1]; ++idx) {
+                int32_t i = ap_row_idx[idx];
+                int32_t len = 0;
+                for (; tags[i] != k; i = parent[i]) {
+                    pattern[len++] = i;
+                    tags[i] = k;
+                }
+                while (len > 0) {
+                    pattern[--top] = pattern[--len];
+                }
+            }
+            for (int32_t t = top; t < n; ++t) {
+                int32_t i = pattern[t];
+                int32_t p2 = Lp[i] + nz_per_col[i];
+                Li[p2] = k;
+                nz_per_col[i]++;
+                row_col[r_cursor] = i;
+                row_lpos[r_cursor] = p2;
+                r_cursor++;
+            }
+        }
+        row_ptr[n] = r_cursor;
+
+        main_ws.init(n, nnz_L);
+    }
+
+    void permuteVector(const Ref<const VectorXd> &v_orig, vector<double> &v_perm) const {
+        v_perm.resize(n);
+        for (int32_t k = 0; k < n; ++k) {
+            v_perm[k] = v_orig[perm_inv[k]];
+        }
+    }
+
+    bool factorize(const double * __restrict w_perm, double cur_tao, Workspace &ws, double &out_logdet) const {
+        if (n == 0) {
+            out_logdet = 0.0;
+            return true;
+        }
+        double * __restrict Lx = ws.Lx.data();
+        double * __restrict diag = ws.diag.data();
+        double * __restrict inv_diag = ws.inv_diag.data();
+        double * __restrict y = ws.y.data();
+        const int32_t * __restrict lp = Lp.data();
+        const int32_t * __restrict li = Li.data();
+        const int32_t * __restrict ap_p = ap_col_ptr.data();
+        const int32_t * __restrict ap_i = ap_row_idx.data();
+        const double * __restrict ap_v = ap_val.data();
+        const double * __restrict ap_d = ap_diag.data();
+        const int32_t * __restrict rp = row_ptr.data();
+        const int32_t * __restrict rc = row_col.data();
+        const int32_t * __restrict rl = row_lpos.data();
+
+        for (int32_t k = 0; k < n; ++k) {
+            for (int32_t idx = ap_p[k]; idx < ap_p[k + 1]; ++idx) {
+                y[ap_i[idx]] = cur_tao * ap_v[idx];
+            }
+            double d = w_perm[k] + cur_tao * ap_d[k];
+            const int32_t r_end = rp[k + 1];
+            for (int32_t r = rp[k]; r < r_end; ++r) {
+                const int32_t i = rc[r];
+                const int32_t p2 = rl[r];
+                const double yi = y[i];
+                y[i] = 0.0;
+                const double l_ki = yi / diag[i];
+                for (int32_t p = lp[i]; p < p2; ++p) {
+                    y[li[p]] -= Lx[p] * yi;
+                }
+                d -= l_ki * yi;
+                Lx[p2] = l_ki;
+            }
+            if (!(d > 0.0)) {
+                return false;
+            }
+            diag[k] = d;
+            inv_diag[k] = 1.0 / d;
+        }
+
+        Map<const VectorXd> d_vec(diag, n);
+        out_logdet = d_vec.array().log().sum();
+        return std::isfinite(out_logdet);
+    }
+
+    void solveMatrix(const Ref<const MatrixXd> &rhs, MatrixXd &out, Workspace &ws) const {
+        const Eigen::Index cols = rhs.cols();
+        ws.solve_buf.resize(n, cols);
+        out.resize(n, cols);
+        if (n == 0) return;
+
+        const int32_t * __restrict pinv = perm_inv.data();
+        const int32_t * __restrict lp = Lp.data();
+        const int32_t * __restrict li = Li.data();
+        const double * __restrict Lx = ws.Lx.data();
+        const double * __restrict inv_diag = ws.inv_diag.data();
+
+        for (Eigen::Index col = 0; col < cols; ++col) {
+            const double * __restrict src = rhs.col(col).data();
+            double * __restrict dst = ws.solve_buf.col(col).data();
+            for (int32_t k = 0; k < n; ++k) {
+                dst[k] = src[pinv[k]];
+            }
+            if (nnz_L > 0) {
+                for (int32_t i = 0; i < n; ++i) {
+                    const double tmp = dst[i];
+                    if (tmp != 0.0) {
+                        for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                            dst[li[p]] -= tmp * Lx[p];
+                        }
+                    }
+                }
+            }
+            for (int32_t i = 0; i < n; ++i) {
+                dst[i] *= inv_diag[i];
+            }
+            if (nnz_L > 0) {
+                for (int32_t i = n - 1; i >= 0; --i) {
+                    double tmp = dst[i];
+                    for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                        tmp -= Lx[p] * dst[li[p]];
+                    }
+                    dst[i] = tmp;
+                }
+            }
+            double * __restrict out_col = out.col(col).data();
+            for (int32_t k = 0; k < n; ++k) {
+                out_col[pinv[k]] = dst[k];
+            }
+        }
+    }
+
+    void solveVector(const Ref<const VectorXd> &rhs, VectorXd &out, Workspace &ws) const {
+        ws.solve_buf.resize(n, 1);
+        out.resize(n);
+        if (n == 0) return;
+
+        const int32_t * __restrict pinv = perm_inv.data();
+        const int32_t * __restrict lp = Lp.data();
+        const int32_t * __restrict li = Li.data();
+        const double * __restrict Lx = ws.Lx.data();
+        const double * __restrict inv_diag = ws.inv_diag.data();
+
+        const double * __restrict src = rhs.data();
+        double * __restrict dst = ws.solve_buf.data();
+        for (int32_t k = 0; k < n; ++k) {
+            dst[k] = src[pinv[k]];
+        }
+        if (nnz_L > 0) {
+            for (int32_t i = 0; i < n; ++i) {
+                const double tmp = dst[i];
+                if (tmp != 0.0) {
+                    for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                        dst[li[p]] -= tmp * Lx[p];
+                    }
+                }
+            }
+        }
+        for (int32_t i = 0; i < n; ++i) {
+            dst[i] *= inv_diag[i];
+        }
+        if (nnz_L > 0) {
+            for (int32_t i = n - 1; i >= 0; --i) {
+                double tmp = dst[i];
+                for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                    tmp -= Lx[p] * dst[li[p]];
+                }
+                dst[i] = tmp;
+            }
+        }
+        double * __restrict out_ptr = out.data();
+        for (int32_t k = 0; k < n; ++k) {
+            out_ptr[pinv[k]] = dst[k];
+        }
+    }
+
+    void solveVectorWithMainFactor(const Ref<const VectorXd> &rhs, VectorXd &out, VectorXd &tmp_buf) const {
+        tmp_buf.resize(n);
+        out.resize(n);
+        if (n == 0) return;
+
+        const int32_t * __restrict pinv = perm_inv.data();
+        const int32_t * __restrict lp = Lp.data();
+        const int32_t * __restrict li = Li.data();
+        const double * __restrict Lx = main_ws.Lx.data();
+        const double * __restrict inv_diag = main_ws.inv_diag.data();
+
+        const double * __restrict src = rhs.data();
+        double * __restrict dst = tmp_buf.data();
+        for (int32_t k = 0; k < n; ++k) {
+            dst[k] = src[pinv[k]];
+        }
+        if (nnz_L > 0) {
+            for (int32_t i = 0; i < n; ++i) {
+                const double tmp = dst[i];
+                if (tmp != 0.0) {
+                    for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                        dst[li[p]] -= tmp * Lx[p];
+                    }
+                }
+            }
+        }
+        for (int32_t i = 0; i < n; ++i) {
+            dst[i] *= inv_diag[i];
+        }
+        if (nnz_L > 0) {
+            for (int32_t i = n - 1; i >= 0; --i) {
+                double tmp = dst[i];
+                for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                    tmp -= Lx[p] * dst[li[p]];
+                }
+                dst[i] = tmp;
+            }
+        }
+        double * __restrict out_ptr = out.data();
+        for (int32_t k = 0; k < n; ++k) {
+            out_ptr[pinv[k]] = dst[k];
+        }
+    }
 };
 
 struct MDLHeader{
@@ -3880,6 +4269,9 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
     }
     LOGGER << "GLM finished, fixed effects: " << est_a.transpose() << std::endl;
 
+    binSolverV.reset(new BinSparseLDLT());
+    binSolverV->init(fam);
+    vector<double> w_perm;
 
     SpMat W(num_indi, num_indi);
     W.setIdentity();
@@ -3897,16 +4289,13 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
 
     {
         // test the tao val
-    
-        W.diagonal() = var_mu_i;
-        SpMat V = W + cur_tao * fam;
-        solverV.compute(V);
-
-        if(solverV.info() != Eigen::Success){
+        binSolverV->permuteVector(var_mu_i, w_perm);
+        double logdet_init = 0.0;
+        if(!binSolverV->factorize(w_perm.data(), cur_tao, binSolverV->main_ws, logdet_init)){
             LOGGER.e(0, "can't invert the V matrix!");
         }
 
-        ViX = solverV.solve(covar); // n*c
+        binSolverV->solveMatrix(covar, ViX, binSolverV->main_ws); // n*c
 
         auto XtVX_solver = (covar.transpose() * ViX).colPivHouseholderQr();
         if(!XtVX_solver.isInvertible()){
@@ -3914,7 +4303,8 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         }
 
         inv_XtVX_ViX = XtVX_solver.solve(ViX.transpose()); // c*n
-        VectorXd ViY = solverV.solve(Y);
+        VectorXd ViY;
+        binSolverV->solveVector(Y, ViY, binSolverV->main_ws);
   
         est_a = inv_XtVX_ViX * Y;
         Xa_b = Y.array() - var_mu_i.array() * (ViY - ViX * est_a).array();
@@ -3955,11 +4345,20 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
     vector<double> hisTao(maxIter);
     double startTao, endTao;
     vector<int> trails;
+    int max_omp_threads = 1;
+#ifdef _OPENMP
+    max_omp_threads = std::max(1, omp_get_max_threads());
+#endif
+    vector<BinSparseLDLT::Workspace> thread_ws(max_omp_threads);
+    for(int t = 0; t < max_omp_threads; ++t){
+        thread_ws[t].init(binSolverV->n, binSolverV->nnz_L);
+    }
+
     while(curIter < maxIter && (!bConverge) && numAbTol < 5){
         LOGGER << "------------------------------------" << std::endl;
         double pre_tao = cur_tao;
         VectorXd pre_est_a = est_a;
-        W.diagonal() = var_mu_i;
+        binSolverV->permuteVector(var_mu_i, w_perm);
 
         double varY = varVector(Y);
         //double MAX_Vg = Vp * options_d["h2_limit"];
@@ -4037,12 +4436,62 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
             vector<double> varcomps(n_trails);
             vector<double> logLs(n_trails);
 
-            #pragma omp parallel for
-            for(int i = 0; i < n_trails; i++){
-                double temp_tao = start + i * step;
-                varcomps[i] = temp_tao;
-                logLs[i] = binLogL(temp_tao, fam, W, Y, covar);
+#if defined(OPENBLAS_CONST)
+            int prev_blas_threads = openblas_get_num_threads();
+            openblas_set_num_threads(1);
+#endif
+            #pragma omp parallel
+            {
+                #pragma omp single
+                {
+#ifdef _OPENMP
+                    int active_threads = omp_get_num_threads();
+                    if (active_threads > static_cast<int>(thread_ws.size())) {
+                        int old_sz = static_cast<int>(thread_ws.size());
+                        thread_ws.resize(active_threads);
+                        for (int t = old_sz; t < active_threads; ++t) {
+                            thread_ws[t].init(binSolverV->n, binSolverV->nnz_L);
+                        }
+                    }
+#endif
+                }
+#if GCTA_CPU_x86
+                mkl_set_num_threads_local(1);
+#endif
+                int tid = 0;
+#ifdef _OPENMP
+                tid = omp_get_thread_num();
+#endif
+                BinSparseLDLT::Workspace &ws = thread_ws[tid];
+
+                #pragma omp for schedule(dynamic)
+                for(int i = 0; i < n_trails; i++){
+                    double temp_tao = start + i * step;
+                    varcomps[i] = temp_tao;
+                    double logdet_V = 0.0;
+                    if(!binSolverV->factorize(w_perm.data(), temp_tao, ws, logdet_V)){
+                        logLs[i] = -std::numeric_limits<double>::infinity();
+                        continue;
+                    }
+                    binSolverV->solveMatrix(covar, ws.ViX, ws);
+                    auto XtVX_solver = (covar.transpose() * ws.ViX).colPivHouseholderQr();
+                    if(!XtVX_solver.isInvertible()){
+                        logLs[i] = -std::numeric_limits<double>::infinity();
+                        continue;
+                    }
+                    double logdet_XtVX = XtVX_solver.logAbsDeterminant();
+                    MatrixXd local_inv_XtVX_ViX = XtVX_solver.solve(ws.ViX.transpose());
+                    binSolverV->solveVector(Y, ws.ViY, ws);
+                    VectorXd PY = ws.ViY - ws.ViX * (local_inv_XtVX_ViX * Y);
+                    logLs[i] = -0.5 * (logdet_V + logdet_XtVX + Y.dot(PY));
+                }
+#if GCTA_CPU_x86
+                mkl_set_num_threads_local(0);
+#endif
             }
+#if defined(OPENBLAS_CONST)
+            openblas_set_num_threads(prev_blas_threads);
+#endif
 
             double max_logL = -1e300;
             double max_varcomp = 0;
@@ -4132,14 +4581,12 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         }else{
             numAbTol = 0;
         }
-        SpMat V = W + cur_tao * fam;
-        solverV.compute(V);
-
-        if(solverV.info() != Eigen::Success){
+        double logdet_iter = 0.0;
+        if(!binSolverV->factorize(w_perm.data(), cur_tao, binSolverV->main_ws, logdet_iter)){
             LOGGER.e(0, "can't invert the V matrix.");
         }
 
-        ViX = solverV.solve(covar); // n*c
+        binSolverV->solveMatrix(covar, ViX, binSolverV->main_ws); // n*c
 
         auto XtVX_solver = (covar.transpose() * ViX).colPivHouseholderQr();
         if(!XtVX_solver.isInvertible()){
@@ -4147,7 +4594,8 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         }
 
         inv_XtVX_ViX = XtVX_solver.solve(ViX.transpose()); // c*n
-        VectorXd ViY = solverV.solve(Y);
+        VectorXd ViY;
+        binSolverV->solveVector(Y, ViY, binSolverV->main_ws);
   
         est_a = inv_XtVX_ViX * Y;
         Xa_b = Y.array() - var_mu_i.array() * (ViY - ViX * est_a).array();
@@ -4196,17 +4644,14 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
     H = t_solver.solve(XtW);
 
     // for 
-    W.diagonal() = var_mu_i;
-    SpMat V = W + cur_tao * fam;
-    solverV.compute(V);
-
+    binSolverV->permuteVector(var_mu_i, w_perm);
     taoVal = cur_tao;
-
-    if(solverV.info() != Eigen::Success){
+    double logdet_final = 0.0;
+    if(!binSolverV->factorize(w_perm.data(), cur_tao, binSolverV->main_ws, logdet_final)){
         LOGGER.e(0, "can't invert the V matrix.");
     }
 
-    ViX = solverV.solve(covar); // n*c
+    binSolverV->solveMatrix(covar, ViX, binSolverV->main_ws); // n*c
 
     auto XtVX_solver = (covar.transpose() * ViX).colPivHouseholderQr();
     if(!XtVX_solver.isInvertible()){
@@ -4292,30 +4737,32 @@ void FastFAM::initBinary(const SpMat &fam){
     }
     ViX.resize(0,0);
     inv_XtVX_ViX.resize(0,0);
+    binSolverV.reset();
     //solverV.~SimplicialLDLT<SpMat>();
 }
 
 void FastFAM::binGrammar_func(uintptr_t *genobuf, const vector<uint32_t> &markerIndex){
     int nMarker = markerIndex.size();
-    #pragma omp parallel for schedule(dynamic)
-    for(int i = 0; i < nMarker; i++){
-        int index_cur_marker = num_grammar_markers + i;
-        GenoBufItem item;
-        item.extractedMarkerIndex = markerIndex[i];
-        geno->getGenoDouble(genobuf, i, &item);
-        bValids[index_cur_marker] = item.valid;
-        if(item.valid){
-            Map< VectorXd > curGeno(item.geno.data(), num_indi);
-            if(bPreciseCovar) conditionCovarBinReg(curGeno);
-            //VectorXd PY = solverV.solve(Y) - ViX * inv_XtVX_ViX * Y;
-            VectorXd PG = solverV.solve(curGeno) - ViX * (inv_XtVX_ViX * curGeno);
-            //VectorXd centerGeno = curGeno.array() - curGeno.mean();
-            //VectorXd WG = dWp.cwiseProduct(centerGeno);
-            //double temp_gamma = curGeno.dot(PG) / centerGeno.dot(WG);
-            VectorXd WG = dWp.cwiseProduct(curGeno);
-            double temp_gamma = curGeno.dot(PG) / curGeno.dot(WG);
+    #pragma omp parallel
+    {
+        VectorXd solve_tmp, ViG;
+        #pragma omp for schedule(dynamic)
+        for(int i = 0; i < nMarker; i++){
+            int index_cur_marker = num_grammar_markers + i;
+            GenoBufItem item;
+            item.extractedMarkerIndex = markerIndex[i];
+            geno->getGenoDouble(genobuf, i, &item);
+            bValids[index_cur_marker] = item.valid;
+            if(item.valid){
+                Map< VectorXd > curGeno(item.geno.data(), num_indi);
+                if(bPreciseCovar) conditionCovarBinReg(curGeno);
+                binSolverV->solveVectorWithMainFactor(curGeno, ViG, solve_tmp);
+                VectorXd PG = ViG - ViX * (inv_XtVX_ViX * curGeno);
+                VectorXd WG = dWp.cwiseProduct(curGeno);
+                double temp_gamma = curGeno.dot(PG) / curGeno.dot(WG);
 
-            v_c_infs[index_cur_marker] = temp_gamma;
+                v_c_infs[index_cur_marker] = temp_gamma;
+            }
         }
     }
     num_grammar_markers += nMarker;
