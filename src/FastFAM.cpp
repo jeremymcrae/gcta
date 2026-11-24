@@ -630,6 +630,236 @@ struct FastFAM::BinSparseLDLT {
         return -0.5 * (logdet_s + logdet_r + logdet_XtVX + yPy);
     }
 
+    // Exact REML logL(0), right-hand score d(logL)/d(tao)|_{tao=0}, and Fisher information I(0)
+    // using purely diagonal V(0) = diag(w) (zero Cholesky factorizations).
+    bool evalZeroTaoScoreAndInfo(const double * __restrict w_s, const double * __restrict w_r_perm,
+                                 double &out_logL0, double &out_score0, double &out_fisher0) const {
+        const int32_t c = n_covar;
+        const int32_t m = c + 1;
+
+        MatrixXd G0 = MatrixXd::Zero(m, m);
+        double logdet_v0 = 0.0;
+
+        // 1. Parallel Gram & logdet at tao = 0 across singletons and relateds
+        if (n_s > 0) {
+            const int32_t n_tiles = (n_s + kGramTileRows - 1) / kGramTileRows;
+            vector<MatrixXd> g_part(static_cast<size_t>(n_tiles));
+            vector<double> ld_part(static_cast<size_t>(n_tiles), 0.0);
+            int any_bad = 0;
+            ScopedSingleThreadBLAS blas_guard;
+            #pragma omp parallel if(n_s >= 4096)
+            {
+                ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                RowMatrixXd S_tile(kGramTileRows, m);
+                double d_tile[kGramTileRows];
+                #pragma omp for schedule(static) reduction(|:any_bad)
+                for (int32_t t = 0; t < n_tiles; ++t) {
+                    const int32_t r0 = t * kGramTileRows;
+                    const int32_t rows = std::min<int32_t>(kGramTileRows, n_s - r0);
+                    auto B_blk = B_s.middleRows(r0, rows);
+                    auto S_blk = S_tile.topRows(rows);
+                    int local_bad = 0;
+                    for (int32_t r = 0; r < rows; ++r) {
+                        const double d = w_s[r0 + r];
+                        if (!(d > 0.0)) { local_bad = 1; break; }
+                        d_tile[r] = d;
+                        S_blk.row(r) = (1.0 / d) * B_blk.row(r);
+                    }
+                    if (local_bad) {
+                        any_bad |= 1;
+                    } else {
+                        Map<const Eigen::ArrayXd> da(d_tile, rows);
+                        ld_part[static_cast<size_t>(t)] = da.log().sum();
+                        g_part[static_cast<size_t>(t)].noalias() = B_blk.transpose() * S_blk;
+                    }
+                }
+            }
+            if (any_bad) return false;
+            for (int32_t t = 0; t < n_tiles; ++t) {
+                logdet_v0 += ld_part[static_cast<size_t>(t)];
+                G0.noalias() += g_part[static_cast<size_t>(t)];
+            }
+        }
+
+        if (n > 0) {
+            const int32_t n_tiles = (n + kGramTileRows - 1) / kGramTileRows;
+            vector<MatrixXd> g_part(static_cast<size_t>(n_tiles));
+            vector<double> ld_part(static_cast<size_t>(n_tiles), 0.0);
+            int any_bad = 0;
+            ScopedSingleThreadBLAS blas_guard;
+            #pragma omp parallel if(n >= 4096)
+            {
+                ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                RowMatrixXd S_tile(kGramTileRows, m);
+                double d_tile[kGramTileRows];
+                #pragma omp for schedule(static) reduction(|:any_bad)
+                for (int32_t t = 0; t < n_tiles; ++t) {
+                    const int32_t r0 = t * kGramTileRows;
+                    const int32_t rows = std::min<int32_t>(kGramTileRows, n - r0);
+                    auto B_blk = B_r_perm.middleRows(r0, rows);
+                    auto S_blk = S_tile.topRows(rows);
+                    int local_bad = 0;
+                    for (int32_t r = 0; r < rows; ++r) {
+                        const double d = w_r_perm[r0 + r];
+                        if (!(d > 0.0)) { local_bad = 1; break; }
+                        d_tile[r] = d;
+                        S_blk.row(r) = (1.0 / d) * B_blk.row(r);
+                    }
+                    if (local_bad) {
+                        any_bad |= 1;
+                    } else {
+                        Map<const Eigen::ArrayXd> da(d_tile, rows);
+                        ld_part[static_cast<size_t>(t)] = da.log().sum();
+                        g_part[static_cast<size_t>(t)].noalias() = B_blk.transpose() * S_blk;
+                    }
+                }
+            }
+            if (any_bad) return false;
+            for (int32_t t = 0; t < n_tiles; ++t) {
+                logdet_v0 += ld_part[static_cast<size_t>(t)];
+                G0.noalias() += g_part[static_cast<size_t>(t)];
+            }
+        }
+
+        MatrixXd XtDinvX = G0.topLeftCorner(c, c);
+        Eigen::ColPivHouseholderQR<MatrixXd> x_solver(XtDinvX);
+        if (!x_solver.isInvertible()) return false;
+        const double logdet_x = x_solver.logAbsDeterminant();
+        const VectorXd XtDinvY = G0.block(0, c, c, 1);
+        const VectorXd beta0 = x_solver.solve(XtDinvY);
+        const MatrixXd C0 = x_solver.solve(MatrixXd::Identity(c, c));
+        const double yPy0 = G0(c, c) - XtDinvY.dot(beta0);
+        out_logL0 = -0.5 * (logdet_v0 + logdet_x + yPy0);
+        if (!std::isfinite(out_logL0)) return false;
+
+        // 2. Exact score l'(0) and Fisher information I(0)
+        double rKr = 0.0;
+        double tr_DinvK = 0.0;
+        double tr_DinvK2 = 0.0;
+        MatrixXd MtKM = MatrixXd::Zero(c, c);
+        MatrixXd QtDinvQ = MatrixXd::Zero(c, c);
+
+        if (n_s > 0) {
+            const double * __restrict kd_s = k_diag_s.data();
+            const int32_t n_tiles = (n_s + kGramTileRows - 1) / kGramTileRows;
+            vector<double> rkr_p(static_cast<size_t>(n_tiles), 0.0);
+            vector<double> tr1_p(static_cast<size_t>(n_tiles), 0.0);
+            vector<double> tr2_p(static_cast<size_t>(n_tiles), 0.0);
+            vector<MatrixXd> mtkm_p(static_cast<size_t>(n_tiles));
+            vector<MatrixXd> qtdq_p(static_cast<size_t>(n_tiles));
+
+            ScopedSingleThreadBLAS blas_guard;
+            #pragma omp parallel if(n_s >= 4096)
+            {
+                ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                RowMatrixXd S1_tile(kGramTileRows, c);
+                RowMatrixXd S2_tile(kGramTileRows, c);
+                VectorXd r_tile(kGramTileRows);
+                #pragma omp for schedule(static)
+                for (int32_t t = 0; t < n_tiles; ++t) {
+                    const int32_t r0 = t * kGramTileRows;
+                    const int32_t rows = std::min<int32_t>(kGramTileRows, n_s - r0);
+                    auto X_blk = B_s.block(r0, 0, rows, c);
+                    auto y_blk = B_s.block(r0, c, rows, 1);
+                    auto rt = r_tile.head(rows);
+                    rt.noalias() = y_blk - X_blk * beta0;
+                    auto S1 = S1_tile.topRows(rows);
+                    auto S2 = S2_tile.topRows(rows);
+
+                    double loc_rkr = 0.0, loc_tr1 = 0.0, loc_tr2 = 0.0;
+                    for (int32_t r = 0; r < rows; ++r) {
+                        const double inv_d = 1.0 / w_s[r0 + r];
+                        const double ks = kd_s[r0 + r];
+                        const double kd_ratio = ks * inv_d;
+                        const double r0_i = inv_d * rt[r];
+                        loc_rkr += ks * r0_i * r0_i;
+                        loc_tr1 += kd_ratio;
+                        loc_tr2 += kd_ratio * kd_ratio;
+                        const double w1 = ks * inv_d * inv_d;
+                        const double w2 = kd_ratio * kd_ratio * inv_d;
+                        S1.row(r) = w1 * X_blk.row(r);
+                        S2.row(r) = w2 * X_blk.row(r);
+                    }
+                    rkr_p[static_cast<size_t>(t)] = loc_rkr;
+                    tr1_p[static_cast<size_t>(t)] = loc_tr1;
+                    tr2_p[static_cast<size_t>(t)] = loc_tr2;
+                    mtkm_p[static_cast<size_t>(t)].noalias() = X_blk.transpose() * S1;
+                    qtdq_p[static_cast<size_t>(t)].noalias() = X_blk.transpose() * S2;
+                }
+            }
+            for (int32_t t = 0; t < n_tiles; ++t) {
+                rKr += rkr_p[static_cast<size_t>(t)];
+                tr_DinvK += tr1_p[static_cast<size_t>(t)];
+                tr_DinvK2 += tr2_p[static_cast<size_t>(t)];
+                MtKM.noalias() += mtkm_p[static_cast<size_t>(t)];
+                QtDinvQ.noalias() += qtdq_p[static_cast<size_t>(t)];
+            }
+        }
+
+        if (n > 0) {
+            VectorXd inv_dr(n);
+            VectorXd r_r(n);
+            RowMatrixXd M_r(n, c);
+            auto X_r = B_r_perm.leftCols(c);
+            auto y_r = B_r_perm.col(c);
+            r_r.noalias() = y_r - X_r * beta0;
+            for (int32_t k = 0; k < n; ++k) {
+                const double inv_d = 1.0 / w_r_perm[k];
+                inv_dr[k] = inv_d;
+                r_r[k] *= inv_d;
+                M_r.row(k) = inv_d * X_r.row(k);
+            }
+
+            VectorXd q_r = VectorXd::Zero(n);
+            RowMatrixXd Q_r = RowMatrixXd::Zero(n, c);
+            const int32_t * __restrict ap_p = ap_col_ptr.data();
+            const int32_t * __restrict ap_i = ap_row_idx.data();
+            const double * __restrict ap_v = ap_val.data();
+            const double * __restrict ap_d = ap_diag.data();
+            const double * __restrict idr = inv_dr.data();
+
+            double loc_tr1 = 0.0;
+            double loc_tr2 = 0.0;
+            for (int32_t k = 0; k < n; ++k) {
+                const double dk = ap_d[k];
+                const double ik = idr[k];
+                const double kd = dk * ik;
+                loc_tr1 += kd;
+                loc_tr2 += kd * kd;
+                q_r[k] += dk * r_r[k];
+                Q_r.row(k) += dk * M_r.row(k);
+
+                for (int32_t idx = ap_p[k]; idx < ap_p[k + 1]; ++idx) {
+                    const int32_t i = ap_i[idx];
+                    const double v = ap_v[idx];
+                    loc_tr2 += 2.0 * (v * v) * idr[i] * ik;
+                    q_r[i] += v * r_r[k];
+                    q_r[k] += v * r_r[i];
+                    Q_r.row(i) += v * M_r.row(k);
+                    Q_r.row(k) += v * M_r.row(i);
+                }
+            }
+            rKr += r_r.dot(q_r);
+            tr_DinvK += loc_tr1;
+            tr_DinvK2 += loc_tr2;
+            MtKM.noalias() += M_r.transpose() * Q_r;
+
+            RowMatrixXd DinvQ_r(n, c);
+            for (int32_t k = 0; k < n; ++k) {
+                DinvQ_r.row(k) = idr[k] * Q_r.row(k);
+            }
+            QtDinvQ.noalias() += Q_r.transpose() * DinvQ_r;
+        }
+
+        const MatrixXd C0_MtKM = C0 * MtKM;
+        const double tr_P0K = tr_DinvK - C0_MtKM.trace();
+        out_score0 = 0.5 * (rKr - tr_P0K);
+
+        const double tr_P0KP0K = tr_DinvK2 - 2.0 * (C0 * QtDinvQ).trace() + (C0_MtKM * C0_MtKM).trace();
+        out_fisher0 = 0.5 * std::max(0.0, tr_P0KP0K);
+        return std::isfinite(out_score0) && std::isfinite(out_fisher0);
+    }
+
     void permuteWeights(const Ref<const VectorXd> &v_orig, vector<double> &v_s, vector<double> &v_r_perm) const {
         v_s.resize(n_s);
         double * __restrict vs_dst = v_s.data();
@@ -5046,14 +5276,7 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
     double tol = 5e-5;
     double abTol = 1e-6;
     int numAbTol = 0;
-    vector<int> trailsFull = {801, 16, 16, 16, 16, 16, 16};
-    vector<int> trailsHalf = {201, 16, 16, 16, 16, 16, 16};
-    vector<int> trailsFine = {51, 16, 16, 16, 16, 16, 16};
-    double cutThresh = 0.1;
-    int numFullGrid = 3;
     vector<double> hisTao(maxIter);
-    double startTao, endTao;
-    vector<int> trails;
     int max_omp_threads = 1;
 #ifdef _OPENMP
     max_omp_threads = std::max(1, omp_get_max_threads());
@@ -5082,225 +5305,479 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         binSolverV->updateWorkingState(var_mu_i, Y, w_s, w_r_perm);
 
         double varY = varVector(Y);
-        //double MAX_Vg = Vp * options_d["h2_limit"];
-        if(curIter == 0){
-            trails = trailsFull;
-            startTao = 0;
-            endTao = varY * 1.01;
-            LOGGER << "Fine tuning within " << startTao << " ~ " << endTao << " with " << trails[0] << " steps." << std::endl;
-        } else if(curIter > 0 & curIter < numFullGrid){
-            trails = trailsHalf;
-            startTao = 0;
-            endTao = pre_tao * 10;
-            if(endTao > varY){
-                endTao = varY * 1.01;
-            }
-            // make sure don't sacrafice the precision
-            int temp_step = (int)((endTao / varY) * trailsFull[0]);
-            if(temp_step > trails[0]){
-                trails[0] = temp_step;
-            }
-            LOGGER << "Fine tuning within " << startTao << " ~ " << endTao << " with " << trails[0] << " steps." << std::endl;
-        }else if(curIter == numFullGrid){
-            trails = trailsFine;
-            double sum = 0;
-            double maxTao = 0, minTao = 10000000;
-            for(int i = 0; i < numFullGrid; i++){
-                double curTAO = hisTao[i];
-                sum += curTAO;
-                if(maxTao < curTAO) maxTao = curTAO;
-                if(minTao > curTAO) minTao = curTAO;
-            }
-            double meanTao = sum / numFullGrid; 
-            if(meanTao > cutThresh){
-                startTao = 0.8 * minTao;
-                endTao = 1.2 * maxTao;
-            }else{
-                startTao = 0;
-                endTao = 1.2 * maxTao;
-            }
-            LOGGER << "Mean tao in first 3 iterations: " << meanTao << ". Fine tuning within " << startTao << " ~ " << endTao << " ." << std::endl;
-        }else if(curIter > 2 * numFullGrid){
-            double sum = 0;
-            double maxTao = 0, minTao = 10000000;
-            for(int i = curIter - numFullGrid; i < curIter; i++){
-                double curTAO = hisTao[i];
-                sum += curTAO;
-                if(maxTao < curTAO) maxTao = curTAO;
-                if(minTao > curTAO) minTao = curTAO;
-            }
-            double meanTao = sum / numFullGrid; 
-            if(meanTao > cutThresh){
-                startTao = 0.8 * minTao;
-                endTao = 1.2 * maxTao;
-            }else{
-                startTao = 0;
-                endTao = 1.2 * maxTao;
-            }
-            LOGGER << "Mean tao in past 3 iterations: " << meanTao << ". Fine tuning within " << startTao << " ~ " << endTao << " .\n" << std::endl;
- 
-        }
-        double end_logL = 0;
-        vector<bool> bEndNAN(trails.size());
-        vector<double> starts(trails.size());
-        vector<double> ends(trails.size());
-        vector<double> steps(trails.size());
+        const double max_tao_limit = varY * 1.01;
         int total_infeasible = 0;
         int total_points = 0;
-        
-        double start = startTao;
-        double end = endTao;
+
         vector<std::pair<double, double>> eval_cache;
-        eval_cache.reserve(1024);
+        eval_cache.reserve(256);
 
-       for(int iter = 0; iter < trails.size(); iter++){
-            int n_trails = trails[iter];
-            double step = (end - start) / (n_trails - 1);
-            vector<double> varcomps(n_trails);
-            vector<double> logLs(n_trails);
-            vector<int> todo_indices;
-            todo_indices.reserve(n_trails);
-
-            for(int i = 0; i < n_trails; i++){
-                double temp_tao = start + i * step;
-                varcomps[i] = temp_tao;
-                if(!eval_cache.empty()){
-                    auto it_cache = std::lower_bound(
-                        eval_cache.begin(), eval_cache.end(), temp_tao,
-                        [](const std::pair<double, double> &a, double val){ return a.first < val; });
-                    if(it_cache != eval_cache.end() && it_cache->first == temp_tao){
-                        logLs[i] = it_cache->second;
-                        continue;
-                    }
-                }
-                todo_indices.push_back(i);
+        auto find_cached = [&](double val, double &out_ll) -> bool {
+            if (eval_cache.empty()) return false;
+            const double eps = 1e-15 * std::max(1.0, std::abs(val));
+            auto it = std::lower_bound(
+                eval_cache.begin(), eval_cache.end(), val - eps,
+                [](const std::pair<double, double> &a, double v){ return a.first < v; });
+            if (it != eval_cache.end() && std::abs(it->first - val) <= eps) {
+                out_ll = it->second;
+                return true;
             }
+            return false;
+        };
 
-            const int n_todo = static_cast<int>(todo_indices.size());
-            if(n_todo > 0){
+        auto insert_cached = [&](double val, double ll) {
+            auto it = std::lower_bound(
+                eval_cache.begin(), eval_cache.end(), val,
+                [](const std::pair<double, double> &a, double v){ return a.first < v; });
+            if (it == eval_cache.end() || it->first != val) {
+                eval_cache.insert(it, std::make_pair(val, ll));
+            }
+            total_points++;
+            if (!std::isfinite(ll)) {
+                total_infeasible++;
+            }
+        };
+
+        auto eval_single = [&](double val) -> double {
+            val = std::max(0.0, std::min(max_tao_limit, val));
+            double ll = 0.0;
+            if (find_cached(val, ll)) return ll;
+            ScopedSingleThreadBLAS blas_guard;
+            ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+            ll = binSolverV->evalLogL(w_s.data(), w_r_perm.data(), val, thread_ws[0]);
+            insert_cached(val, ll);
+            return ll;
+        };
+
+        auto eval_batch_parallel = [&](const vector<double> &cands) {
+            vector<double> todo;
+            todo.reserve(cands.size());
+            for (size_t i = 0; i < cands.size(); ++i) {
+                double v = std::max(0.0, std::min(max_tao_limit, cands[i]));
+                double dummy = 0.0;
+                if (find_cached(v, dummy)) continue;
+                bool dup = false;
+                const double eps = 1e-15 * std::max(1.0, std::abs(v));
+                for (size_t j = 0; j < todo.size(); ++j) {
+                    if (std::abs(todo[j] - v) <= eps) { dup = true; break; }
+                }
+                if (!dup) todo.push_back(v);
+            }
+            const int n_todo = static_cast<int>(todo.size());
+            if (n_todo == 0) return;
+            vector<double> res_ll(n_todo, -std::numeric_limits<double>::infinity());
+            {
+                ScopedSingleThreadBLAS blas_guard;
+                #pragma omp parallel
                 {
-                    ScopedSingleThreadBLAS blas_guard;
-                    #pragma omp parallel
+                    #pragma omp single
                     {
-                        #pragma omp single
-                        {
 #ifdef _OPENMP
-                            int active_threads = omp_get_num_threads();
-                            if (active_threads > static_cast<int>(thread_ws.size())) {
-                                int old_sz = static_cast<int>(thread_ws.size());
-                                thread_ws.resize(active_threads);
-                                for (int t = old_sz; t < active_threads; ++t) {
-                                    thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
-                                }
+                        int active_threads = omp_get_num_threads();
+                        if (active_threads > static_cast<int>(thread_ws.size())) {
+                            int old_sz = static_cast<int>(thread_ws.size());
+                            thread_ws.resize(active_threads);
+                            for (int t = old_sz; t < active_threads; ++t) {
+                                thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
                             }
-#endif
                         }
-                        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
-                        int tid = 0;
+#endif
+                    }
+                    ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                    int tid = 0;
 #ifdef _OPENMP
-                        tid = omp_get_thread_num();
+                    tid = omp_get_thread_num();
 #endif
-                        BinSparseLDLT::Workspace &ws = thread_ws[tid];
-
-                        #pragma omp for schedule(dynamic)
-                        for(int k = 0; k < n_todo; k++){
-                            int i = todo_indices[k];
-                            logLs[i] = binSolverV->evalLogL(w_s.data(), w_r_perm.data(), varcomps[i], ws);
-                        }
+                    BinSparseLDLT::Workspace &ws = thread_ws[tid];
+                    #pragma omp for schedule(dynamic)
+                    for (int k = 0; k < n_todo; ++k) {
+                        res_ll[k] = binSolverV->evalLogL(w_s.data(), w_r_perm.data(), todo[k], ws);
                     }
                 }
-                for(int k = 0; k < n_todo; k++){
-                    int i = todo_indices[k];
-                    eval_cache.push_back(std::make_pair(varcomps[i], logLs[i]));
-                }
-                std::sort(eval_cache.begin(), eval_cache.end(),
-                          [](const std::pair<double, double> &a, const std::pair<double, double> &b){
-                              return a.first < b.first;
-                          });
             }
-
-            double max_logL = -1e300;
-            double max_varcomp = 0;
-
-            int max_index = 0;
-            int n_infeasible = 0;
-            for(int i = 0; i < n_trails; i++){
-                double logL = logLs[i];
-                if(!std::isfinite(logL)){
-                    n_infeasible++;
-                    continue;
-                }
-                if(logL > max_logL){
-                    max_logL = logL;
-                    max_varcomp = varcomps[i];
-                    max_index = i;
-                }
+            for (int k = 0; k < n_todo; ++k) {
+                insert_cached(todo[k], res_ll[k]);
             }
-            total_infeasible += n_infeasible;
-            total_points += n_trails;
-
-            if(n_infeasible == n_trails){
-                LOGGER.e(0, "all " + std::to_string(n_trails) + " tao values in iteration "
-                    + std::to_string(iter + 1) + " gave a non-PD V matrix over ["
-                    + std::to_string(start) + ", " + std::to_string(end) + "]. "
-                    "The sparse GRM is likely not PSD; try a denser or PSD-regularised GRM.");
-            }
-            if(max_index == 0){
-                start = varcomps[max_index];
-                end = varcomps[max_index + 1];
-                end_logL = logLs[max_index + 1];
-            }else if(max_index == n_trails - 1){
-                start = varcomps[max_index - 1];
-                end = varcomps[max_index];
-                end_logL = logLs[max_index];
-            }else{
-                start = varcomps[max_index - 1];
-                end = varcomps[max_index + 1];
-                end_logL = logLs[max_index + 1];
-            }
-
-            if(b_reml){
-                for(int i = 0; i < logLs.size(); i++){
-                    out << i << "\t" << logLs[i] << "\t" << varcomps[i] << std::endl;
+            if (b_reml) {
+                for (int k = 0; k < n_todo; ++k) {
+                    out << k << "\t" << res_ll[k] << "\t" << todo[k] << std::endl;
                 }
                 out << "----------------------------" << std::endl;
             }
+        };
 
-            if(!std::isfinite(end_logL)){
-                bEndNAN[iter] = true;
-            }else{
-                bEndNAN[iter] = false;
-            }
-            starts[iter] = start;
-            ends[iter] = end;
-            steps[iter] = step;
-
-
-            LOGGER << "Iteration " << iter + 1 << ", step size: " << step << ", logL: " << max_logL
-                << ". Tao: " << max_varcomp
-                << ", searching range: " << start << " to " << end;
-            if(n_infeasible > 0){
-                LOGGER << ", infeasible: " << n_infeasible << "/" << n_trails;
-            }
-            LOGGER << std::endl;
-            if(b_reml){
-                LOGGER << "\n" << "Upper boundary detail: " << std::endl;
-                LOGGER << "  " << "iter\tstep\tstart\tend\tendNAN" << std::endl;
-                LOGGER << std::boolalpha;
-                for(int iter = 0; iter < trails.size(); iter++){
-                    LOGGER << "  " << iter << "\t" << steps[iter] << "\t" << starts[iter] << "\t" << ends[iter] << "\t" << bEndNAN[iter] << std::endl; 
-                }
-                LOGGER << std::endl;
-            }
-
-
+        // 1. Exact logL(0), score(0), and Fisher info I(0) at tao = 0
+        double logL_0 = -std::numeric_limits<double>::infinity();
+        double score_0 = 0.0;
+        double fisher_0 = 0.0;
+        if (binSolverV->evalZeroTaoScoreAndInfo(w_s.data(), w_r_perm.data(), logL_0, score_0, fisher_0)) {
+            insert_cached(0.0, logL_0);
+        } else {
+            logL_0 = eval_single(0.0);
         }
+
+        const double fs_tao = (fisher_0 > 1e-30 && score_0 > 0.0) ? (score_0 / fisher_0) : 0.0;
+        const double info_scale = (fisher_0 > 1e-30) ? (1.0 / std::sqrt(fisher_0)) : (0.01 * max_tao_limit);
+        const double tao_scale = std::max(1e-8, std::min(max_tao_limit, std::max(fs_tao, info_scale)));
+        const int wave_width = std::max(16, ((16 + max_omp_threads - 1) / max_omp_threads) * max_omp_threads);
+
+        auto make_uniform_grid = [](double lo, double hi, int count, vector<double> &grid) {
+            grid.clear();
+            if (count <= 1 || hi <= lo) {
+                grid.push_back(lo);
+                return;
+            }
+            grid.reserve(count);
+            const double st = (hi - lo) / static_cast<double>(count - 1);
+            for (int i = 0; i < count; ++i) {
+                grid.push_back(lo + i * st);
+            }
+            grid.back() = hi;
+        };
+
+        // 2. Thread-adaptive bracketing
+        if (curIter == 0) {
+            const int coarse_width = std::max(32, ((32 + max_omp_threads - 1) / max_omp_threads) * max_omp_threads);
+            const int n_low = coarse_width / 2;
+            const int n_high = coarse_width - n_low;
+            const double pivot = std::min(max_tao_limit * 0.25, std::max(8.0 * tao_scale, 1e-4 * max_tao_limit));
+
+            vector<double> cands;
+            cands.reserve(coarse_width + 2);
+            cands.push_back(0.0);
+            if (fs_tao > 0.0 && fs_tao < max_tao_limit) {
+                cands.push_back(fs_tao);
+            }
+            for (int i = 1; i <= n_low; ++i) {
+                const double frac = static_cast<double>(i) / static_cast<double>(n_low);
+                cands.push_back(pivot * frac * frac);
+            }
+            for (int i = 1; i <= n_high; ++i) {
+                const double frac = static_cast<double>(i) / static_cast<double>(n_high);
+                cands.push_back(pivot + (max_tao_limit - pivot) * frac);
+            }
+            LOGGER << "Fine tuning within 0 ~ " << max_tao_limit << " with adaptive parallel waves (width " << wave_width << ")." << std::endl;
+            eval_batch_parallel(cands);
+        } else {
+            if (pre_tao == 0.0 && score_0 <= 0.0) {
+                const double probe_eps = std::min(max_tao_limit, 1e-7 * std::max(1.0, tao_scale));
+                eval_single(probe_eps);
+            } else {
+                const double center = (pre_tao > 0.0) ? pre_tao : std::max(fs_tao, 0.1 * tao_scale);
+                double z_lo = 0.0;
+                double z_hi = max_tao_limit;
+                if (curIter == 1) {
+                    z_lo = 0.0;
+                    z_hi = std::min(max_tao_limit, std::max(3.5 * center, 2.5 * tao_scale));
+                } else {
+                    const double prev_jump = std::abs(hisTao[curIter - 1] - hisTao[curIter - 2]);
+                    const double rad = std::max(4.0 * prev_jump, std::max(0.20 * center, 1e-5 * std::max(1.0, tao_scale)));
+                    z_lo = (center - rad < 0.25 * center) ? 0.0 : (center - rad);
+                    z_hi = std::min(max_tao_limit, center + rad);
+                }
+                vector<double> cands;
+                make_uniform_grid(z_lo, z_hi, wave_width, cands);
+                cands.push_back(pre_tao);
+                eval_batch_parallel(cands);
+
+                // Expand dynamically if maximum hits an interior search-window boundary
+                for (int exp_it = 0; exp_it < 8; ++exp_it) {
+                    int best_k = -1, last_finite_k = -1;
+                    double best_ll = -std::numeric_limits<double>::infinity();
+                    for (int k = 0; k < static_cast<int>(eval_cache.size()); ++k) {
+                        if (std::isfinite(eval_cache[k].second)) {
+                            last_finite_k = k;
+                            if (eval_cache[k].second > best_ll) {
+                                best_ll = eval_cache[k].second;
+                                best_k = k;
+                            }
+                        }
+                    }
+                    if (best_k < 0) break;
+                    const double best_t = eval_cache[best_k].first;
+                    if (best_t >= z_hi - 1e-14 * std::max(1.0, z_hi) && z_hi < max_tao_limit && best_k == last_finite_k) {
+                        const double new_hi = std::min(max_tao_limit, std::max(2.5 * z_hi, z_hi + 2.0 * tao_scale));
+                        make_uniform_grid(z_hi, new_hi, wave_width + 1, cands);
+                        z_hi = new_hi;
+                        eval_batch_parallel(cands);
+                    } else if (z_lo > 0.0 && best_t <= z_lo + 1e-14 * std::max(1.0, z_lo)) {
+                        const double new_lo = (z_lo < 0.05 * tao_scale) ? 0.0 : (0.25 * z_lo);
+                        make_uniform_grid(new_lo, z_lo, wave_width + 1, cands);
+                        z_lo = new_lo;
+                        eval_batch_parallel(cands);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Gather finite evaluated points and check PD feasibility cliff
+        auto get_best_bracket = [&](int &out_best_idx, vector<std::pair<double, double>> &finite_pts, double &first_infeas_above) {
+            finite_pts.clear();
+            first_infeas_above = std::numeric_limits<double>::infinity();
+            out_best_idx = -1;
+            double best_ll = -std::numeric_limits<double>::infinity();
+            for (size_t k = 0; k < eval_cache.size(); ++k) {
+                if (std::isfinite(eval_cache[k].second)) {
+                    const int idx = static_cast<int>(finite_pts.size());
+                    finite_pts.push_back(eval_cache[k]);
+                    if (eval_cache[k].second > best_ll) {
+                        best_ll = eval_cache[k].second;
+                        out_best_idx = idx;
+                    }
+                }
+            }
+            if (out_best_idx >= 0) {
+                const double best_t = finite_pts[out_best_idx].first;
+                for (size_t k = 0; k < eval_cache.size(); ++k) {
+                    if (!std::isfinite(eval_cache[k].second) && eval_cache[k].first > best_t) {
+                        first_infeas_above = eval_cache[k].first;
+                        break;
+                    }
+                }
+            }
+        };
+
+        vector<std::pair<double, double>> finite_pts;
+        int best_idx = -1;
+        double first_infeas_above = std::numeric_limits<double>::infinity();
+        get_best_bracket(best_idx, finite_pts, first_infeas_above);
+
+        if (best_idx < 0) {
+            LOGGER.e(0, "all " + std::to_string(total_points) + " tao values gave a non-PD V matrix over [0, "
+                + std::to_string(max_tao_limit) + "]. The sparse GRM is likely not PSD; try a denser or PSD-regularised GRM.");
+        }
+
+        // If optimum on curIter == 0 is not trivially certified at tao = 0, run one parallel zoom wave
+        bool certified_zero = false;
+        if (best_idx == 0 && score_0 <= 0.0 && finite_pts.size() >= 2) {
+            const double eps_probe = std::min(finite_pts[1].first * 0.1, 1e-7 * std::max(1.0, tao_scale));
+            if (eps_probe <= 0.0 || eval_single(eps_probe) <= logL_0) {
+                certified_zero = true;
+            }
+            get_best_bracket(best_idx, finite_pts, first_infeas_above);
+        }
+
+        if (!certified_zero && curIter == 0) {
+            const double z_lo = (best_idx > 0) ? finite_pts[best_idx - 1].first : finite_pts[0].first;
+            double z_hi = finite_pts.back().first;
+            if (best_idx + 1 < static_cast<int>(finite_pts.size())) {
+                z_hi = finite_pts[best_idx + 1].first;
+            } else if (std::isfinite(first_infeas_above)) {
+                z_hi = first_infeas_above;
+            }
+            if (z_hi > z_lo) {
+                vector<double> zoom_cands;
+                make_uniform_grid(z_lo, z_hi, wave_width + 2, zoom_cands);
+                eval_batch_parallel(zoom_cands);
+                get_best_bracket(best_idx, finite_pts, first_infeas_above);
+            }
+        }
+
+        // If the best point abuts an infeasible non-PD cliff, refine the feasibility boundary
+        if (!certified_zero && best_idx == static_cast<int>(finite_pts.size()) - 1 && std::isfinite(first_infeas_above)) {
+            double lo_feas = finite_pts[best_idx].first;
+            double hi_infeas = first_infeas_above;
+            for (int bi = 0; bi < 24 && (hi_infeas - lo_feas) > 1e-8 * std::max(1.0, lo_feas); ++bi) {
+                const double mid = 0.5 * (lo_feas + hi_infeas);
+                const double ll_mid = eval_single(mid);
+                if (!std::isfinite(ll_mid)) {
+                    hi_infeas = mid;
+                } else if (ll_mid >= finite_pts[best_idx].second) {
+                    lo_feas = mid;
+                    get_best_bracket(best_idx, finite_pts, first_infeas_above);
+                } else {
+                    break;
+                }
+            }
+            get_best_bracket(best_idx, finite_pts, first_infeas_above);
+        }
+
+        // 3. Safeguarded Brent parabolic interpolation polish to machine-tight tolerance
+        double opt_tao = finite_pts[best_idx].first;
+        double opt_logL = finite_pts[best_idx].second;
+
+        if (certified_zero) {
+            opt_tao = 0.0;
+            opt_logL = logL_0;
+        } else if (finite_pts.size() >= 2) {
+            if (best_idx == 0 && score_0 <= 0.0) {
+                const double tiny_t = std::min(0.1 * finite_pts[1].first, 1e-8 * std::max(1.0, tao_scale));
+                const double tiny_ll = eval_single(tiny_t);
+                if (tiny_ll <= logL_0) {
+                    opt_tao = 0.0;
+                    opt_logL = logL_0;
+                } else {
+                    get_best_bracket(best_idx, finite_pts, first_infeas_above);
+                }
+            }
+
+            if (!(best_idx == 0 && score_0 <= 0.0 && opt_tao == 0.0)) {
+                double a = (best_idx > 0) ? finite_pts[best_idx - 1].first : 0.0;
+                double fa = (best_idx > 0) ? -finite_pts[best_idx - 1].second : -logL_0;
+                double b = max_tao_limit;
+                double fb = std::numeric_limits<double>::infinity();
+                if (best_idx + 1 < static_cast<int>(finite_pts.size())) {
+                    b = finite_pts[best_idx + 1].first;
+                    fb = -finite_pts[best_idx + 1].second;
+                } else if (std::isfinite(first_infeas_above)) {
+                    b = first_infeas_above;
+                    fb = std::numeric_limits<double>::infinity();
+                } else {
+                    b = finite_pts.back().first;
+                    fb = -finite_pts.back().second;
+                }
+
+                double x = finite_pts[best_idx].first;
+                double fx = -finite_pts[best_idx].second;
+                if (x <= a || x >= b) {
+                    x = 0.5 * (a + b);
+                    const double ll_x = eval_single(x);
+                    fx = std::isfinite(ll_x) ? -ll_x : std::numeric_limits<double>::infinity();
+                    if (-fa < fx) { x = a + 0.3819660112501051 * (b - a); const double ll2 = eval_single(x); fx = std::isfinite(ll2) ? -ll2 : std::numeric_limits<double>::infinity(); }
+                }
+
+                double w = x, fw = fx;
+                double v = x, fv = fx;
+                if (std::isfinite(fa) && std::isfinite(fb) && a < x && x < b) {
+                    if (fa <= fb) {
+                        w = a; fw = fa;
+                        v = b; fv = fb;
+                    } else {
+                        w = b; fw = fb;
+                        v = a; fv = fa;
+                    }
+                }
+
+                // Parallel parabolic-centered micro-wave so multi-core runs shrink (a, b)
+                // in a single all-threads wave instead of ~12-15 serial single-thread steps.
+                const double init_tol = 2e-7 * std::max(1.0, std::abs(x)) + 1e-9;
+                if (max_omp_threads >= 4 && (b - a) > 4.0 * init_tol && std::isfinite(fa) && std::isfinite(fb) && a < x && x < b) {
+                    const double xa = x - a;
+                    const double xb = x - b;
+                    const double fxa = fx - fa;
+                    const double fxb = fx - fb;
+                    const double denom_q = 2.0 * (xa * fxb - xb * fxa);
+                    double u_center = x;
+                    if (std::abs(denom_q) > 1e-30) {
+                        const double step_q = -(xa * xa * fxb - xb * xb * fxa) / denom_q;
+                        const double cand_u = x + step_q;
+                        if (cand_u > a + 0.02 * (b - a) && cand_u < b - 0.02 * (b - a)) {
+                            u_center = cand_u;
+                        }
+                    }
+                    const double half_span = std::max(2.0 * init_tol, 0.18 * (b - a));
+                    const double m_lo = std::max(a, u_center - half_span);
+                    const double m_hi = std::min(b, u_center + half_span);
+                    vector<double> micro_cands;
+                    make_uniform_grid(m_lo, m_hi, std::max(8, max_omp_threads), micro_cands);
+                    micro_cands.push_back(u_center);
+                    eval_batch_parallel(micro_cands);
+                    get_best_bracket(best_idx, finite_pts, first_infeas_above);
+
+                    a = (best_idx > 0) ? finite_pts[best_idx - 1].first : 0.0;
+                    fa = (best_idx > 0) ? -finite_pts[best_idx - 1].second : -logL_0;
+                    if (best_idx + 1 < static_cast<int>(finite_pts.size())) {
+                        b = finite_pts[best_idx + 1].first;
+                        fb = -finite_pts[best_idx + 1].second;
+                    } else if (std::isfinite(first_infeas_above)) {
+                        b = first_infeas_above;
+                        fb = std::numeric_limits<double>::infinity();
+                    } else {
+                        b = finite_pts.back().first;
+                        fb = -finite_pts.back().second;
+                    }
+                    x = finite_pts[best_idx].first;
+                    fx = -finite_pts[best_idx].second;
+                    w = x; fw = fx; v = x; fv = fx;
+                    if (std::isfinite(fa) && std::isfinite(fb) && a < x && x < b) {
+                        if (fa <= fb) { w = a; fw = fa; v = b; fv = fb; }
+                        else { w = b; fw = fb; v = a; fv = fa; }
+                    }
+                }
+
+                double d = 0.0;
+                double e = b - a;
+                const double cgold = 0.3819660112501051;
+
+                for (int brent_it = 0; brent_it < 24; ++brent_it) {
+                    const double xm = 0.5 * (a + b);
+                    const double tol1 = 2e-7 * std::max(1.0, std::abs(x)) + 1e-9;
+                    const double tol2 = 2.0 * tol1;
+                    if (std::abs(x - xm) <= (tol2 - 0.5 * (b - a))) {
+                        break;
+                    }
+
+                    bool did_parabolic = false;
+                    if (std::abs(e) > tol1 && std::isfinite(fw) && std::isfinite(fv) && w != x && v != x && w != v) {
+                        const double r = (x - w) * (fx - fv);
+                        double q = (x - v) * (fx - fw);
+                        double p = (x - v) * q - (x - w) * r;
+                        q = 2.0 * (q - r);
+                        if (q > 0.0) p = -p;
+                        q = std::abs(q);
+                        const double etemp = e;
+                        e = d;
+                        if (std::abs(p) < std::abs(0.5 * q * etemp) && p > q * (a - x) && p < q * (b - x)) {
+                            d = p / q;
+                            const double u_try = x + d;
+                            if ((u_try - a) < tol2 || (b - u_try) < tol2) {
+                                d = (xm >= x) ? tol1 : -tol1;
+                            }
+                            did_parabolic = true;
+                        }
+                    }
+                    if (!did_parabolic) {
+                        e = (x >= xm) ? (a - x) : (b - x);
+                        d = cgold * e;
+                    }
+
+                    const double u = (std::abs(d) >= tol1) ? (x + d) : (x + (d >= 0.0 ? tol1 : -tol1));
+                    const double ll_u = eval_single(u);
+                    const double fu = std::isfinite(ll_u) ? -ll_u : std::numeric_limits<double>::infinity();
+
+                    if (fu <= fx) {
+                        if (u >= x) a = x; else b = x;
+                        v = w; fv = fw;
+                        w = x; fw = fx;
+                        x = u; fx = fu;
+                    } else {
+                        if (u < x) a = u; else b = u;
+                        if (fu <= fw || w == x) {
+                            v = w; fv = fw;
+                            w = u; fw = fu;
+                        } else if (fu <= fv || v == x || v == w) {
+                            v = u; fv = fu;
+                        }
+                    }
+                }
+
+                // Compare interior Brent optimum against exact boundaries if adjacent
+                opt_tao = x;
+                opt_logL = -fx;
+                if (a == 0.0 && logL_0 >= opt_logL) {
+                    opt_tao = 0.0;
+                    opt_logL = logL_0;
+                }
+                if (b == max_tao_limit) {
+                    const double ll_end = eval_single(max_tao_limit);
+                    if (std::isfinite(ll_end) && ll_end > opt_logL) {
+                        opt_tao = max_tao_limit;
+                        opt_logL = ll_end;
+                    }
+                }
+            }
+        }
+
+        LOGGER << "REML 1D search evaluated " << total_points << " points, max logL: " << opt_logL
+               << ", Tao: " << opt_tao << std::endl;
         if(total_infeasible > 0){
             LOGGER << "Grid search skipped " << total_infeasible << "/" << total_points
                    << " tao values because V was not positive definite. If the converged tao lies"
                    << " close to the infeasible region, consider a denser or PSD-regularised GRM." << std::endl;
         }
-        cur_tao = (start + end) / 2.0;
+        cur_tao = opt_tao;
         hisTao[curIter] = cur_tao;
         if(cur_tao < abTol){
             numAbTol++;
