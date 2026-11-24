@@ -323,6 +323,7 @@ uint32_t Marker::getNextSize(const vector<uint32_t> &rawRef, uint32_t curExtract
     //isSexXY = (cur_chr == mapCHR("Y", success)? 2 : 0); // 2 Y;
 
     fileIndex = getMIndex(cur_index);
+    uint32_t rawIndexStart = (fileIndex == 0) ? 0 : raw_limits[fileIndex - 1];
     uint32_t rawIndexLimits = raw_limits[fileIndex];
 
     uint32_t retSize = 0; 
@@ -332,11 +333,13 @@ uint32_t Marker::getNextSize(const vector<uint32_t> &rawRef, uint32_t curExtract
             break;
         }
         uint32_t temp_index = rawRef[marker_index];
-        if(chr[temp_index] != cur_chr){
-            chr_ends = true;
+        if(temp_index < rawIndexStart || temp_index >= rawIndexLimits){
             break;
         }
-        if(temp_index >= rawIndexLimits){
+        uint8_t temp_chr = chr[temp_index];
+        uint8_t temp_sexXY = (temp_chr == Xchr) ? 1 : ((temp_chr == Ychr) ? 2 : 0);
+        if(temp_sexXY != isSexXY){
+            chr_ends = true;
             break;
         }
         retSize++;

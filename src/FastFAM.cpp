@@ -5451,11 +5451,99 @@ void FastFAM::estBinGamma(){
     num_grammar_markers = 0;
 
     int nModelSNP = 200;
-    int nMarker = 100;
+    int nMarker = nModelSNP;
     int curNumModel = 0;
 
+    int max_omp_threads = 1;
+#ifdef _OPENMP
+    max_omp_threads = std::max(1, omp_get_max_threads());
+#endif
+    const size_t max_stage_bytes = 128ULL * 1024ULL * 1024ULL;
+    const size_t bytes_per_snp = static_cast<size_t>(std::max<uint32_t>(1, num_indi)) * sizeof(double);
+    const int stage_cap = std::min<int>(
+        nModelSNP,
+        std::max<int>(16, std::min<int>(max_omp_threads * 2, static_cast<int>(max_stage_bytes / bytes_per_snp))));
+    MatrixXd staged_genos;
+    vector<int> staged_slots;
+    staged_slots.reserve(stage_cap);
+
+    auto flush_staged = [&]() {
+        const int n_staged = static_cast<int>(staged_slots.size());
+        if (n_staged == 0) return;
+        ScopedSingleThreadBLAS blas_guard;
+        #pragma omp parallel
+        {
+            ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+            VectorXd u_r_buf;
+            VectorXd w_buf(covar.cols());
+            #pragma omp for schedule(dynamic)
+            for (int k = 0; k < n_staged; ++k) {
+                const int out_slot = staged_slots[k];
+                Eigen::Ref<VectorXd> curGeno = staged_genos.col(k);
+                if (bPreciseCovar) conditionCovarBinReg(curGeno);
+                v_c_infs[out_slot] = binSolverV->evalGrammarGamma(curGeno, dWp, ViX, u_r_buf, w_buf);
+            }
+        }
+        staged_slots.clear();
+    };
+
     vector<function<void (uintptr_t *, const vector<uint32_t> &)>> callBacks;
-    callBacks.push_back(bind(&FastFAM::binGrammar_func, this, _1, _2));
+    callBacks.push_back([&](uintptr_t *genobuf, const vector<uint32_t> &mIndex) {
+        const int curBatch = static_cast<int>(mIndex.size());
+        if (curBatch * 2 >= max_omp_threads && staged_slots.empty()) {
+            this->binGrammar_func(genobuf, mIndex);
+            return;
+        }
+        if (staged_genos.cols() < stage_cap) {
+            staged_genos.resize(num_indi, stage_cap);
+        }
+        int offset = 0;
+        while (offset < curBatch) {
+            const int space = stage_cap - static_cast<int>(staged_slots.size());
+            const int take = std::min(space, curBatch - offset);
+            const int base_stage = static_cast<int>(staged_slots.size());
+            vector<uint8_t> local_valid(take, 0);
+            {
+                ScopedSingleThreadBLAS blas_guard;
+                #pragma omp parallel if(take > 1)
+                {
+                    ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                    GenoBufItem item;
+                    item.geno.resize(num_indi);
+                    #pragma omp for schedule(dynamic)
+                    for (int t = 0; t < take; ++t) {
+                        const int src_i = offset + t;
+                        const int index_cur_marker = num_grammar_markers + src_i;
+                        item.extractedMarkerIndex = mIndex[src_i];
+                        item.valid = false;
+                        geno->getGenoDouble(genobuf, src_i, &item);
+                        bValids[index_cur_marker] = item.valid;
+                        local_valid[t] = item.valid ? 1 : 0;
+                        if (item.valid) {
+                            std::memcpy(staged_genos.col(base_stage + t).data(),
+                                        item.geno.data(),
+                                        static_cast<size_t>(num_indi) * sizeof(double));
+                        }
+                    }
+                }
+            }
+            int write_pos = base_stage;
+            for (int t = 0; t < take; ++t) {
+                if (local_valid[t]) {
+                    if (write_pos != base_stage + t) {
+                        staged_genos.col(write_pos) = staged_genos.col(base_stage + t);
+                    }
+                    staged_slots.push_back(num_grammar_markers + offset + t);
+                    write_pos++;
+                }
+            }
+            offset += take;
+            if (static_cast<int>(staged_slots.size()) >= std::min(stage_cap, std::max(max_omp_threads * 2, 32))) {
+                flush_staged();
+            }
+        }
+        num_grammar_markers += curBatch;
+    });
     double cvThreshold = options_d["cv_threshold"];
 
     LOGGER.ts("tuning");
@@ -5471,7 +5559,8 @@ void FastFAM::estBinGamma(){
 
         vector<uint32_t> marker_index(total_markers_index.begin() + curNumModel - nModelSNP, total_markers_index.begin() + curNumModel);
         std::sort(marker_index.begin(), marker_index.end());
-       geno->loopDouble(marker_index, nMarker, true, true, false, false, callBacks);
+        geno->loopDouble(marker_index, nMarker, true, true, false, false, callBacks);
+        flush_staged();
 
         if(curNumModel != num_grammar_markers){
             LOGGER.e(0, "some SNPs were not read successfully!");
