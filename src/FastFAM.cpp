@@ -190,6 +190,7 @@ struct FastFAM::BinSparseLDLT {
         MatrixXd G;
         MatrixXd XtVX;
         MatrixXd solve_buf;
+        vector<double> solve_vec;
         bool is_diag_only = false;
 
         void init(int32_t n_s, int32_t n_r, int32_t nnz_L, int32_t n_cols_aug = 0) {
@@ -199,12 +200,25 @@ struct FastFAM::BinSparseLDLT {
             diag.assign(n_r, 0.0);
             inv_diag.assign(n_r, 0.0);
             y.assign(n_r, 0.0);
+            solve_vec.assign(n_r, 0.0);
             if (n_cols_aug > 0) {
                 U_r.resize(n_r, n_cols_aug);
                 scaled_tile.resize(kGramTileRows, n_cols_aug);
                 G.resize(n_cols_aug, n_cols_aug);
                 XtVX.resize(n_cols_aug - 1, n_cols_aug - 1);
             }
+        }
+
+        // Lightweight worker workspace for evalLogL (omits unused singleton buffers)
+        void initEval(int32_t n_r, int32_t nnz_L, int32_t n_cols_aug) {
+            Lx.assign(nnz_L, 0.0);
+            diag.assign(n_r, 0.0);
+            inv_diag.assign(n_r, 0.0);
+            y.assign(n_r, 0.0);
+            U_r.resize(n_r, n_cols_aug);
+            scaled_tile.resize(kGramTileRows, n_cols_aug);
+            G.resize(n_cols_aug, n_cols_aug);
+            XtVX.resize(n_cols_aug - 1, n_cols_aug - 1);
         }
     };
 
@@ -456,6 +470,10 @@ struct FastFAM::BinSparseLDLT {
         const int32_t m = n_covar + 1;
         B_s.resize(n_s, m);
         B_r_perm.resize(n, m);
+        main_ws.U_r.resize(n, m);
+        main_ws.scaled_tile.resize(kGramTileRows, m);
+        main_ws.G.resize(m, m);
+        main_ws.XtVX.resize(n_covar, n_covar);
 
         const int32_t * __restrict so = s_orig.data();
         #pragma omp parallel for schedule(static) if(n_s >= 4096)
@@ -512,6 +530,35 @@ struct FastFAM::BinSparseLDLT {
     static void accumulateWeightedGram(const RowMatrixXd &B, const double * __restrict inv_d,
                                        int32_t n_rows, int32_t m,
                                        RowMatrixXd &scaled_tile, MatrixXd &G) {
+        bool use_inner_omp = false;
+#ifdef _OPENMP
+        use_inner_omp = (omp_in_parallel() == 0 && omp_get_max_threads() > 1);
+#endif
+        if (use_inner_omp && n_rows >= 4096) {
+            const int32_t n_tiles = (n_rows + kGramTileRows - 1) / kGramTileRows;
+            vector<MatrixXd> g_part(static_cast<size_t>(n_tiles));
+            ScopedSingleThreadBLAS blas_guard;
+            #pragma omp parallel
+            {
+                ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                RowMatrixXd S_tile(kGramTileRows, m);
+                #pragma omp for schedule(static)
+                for (int32_t t = 0; t < n_tiles; ++t) {
+                    const int32_t r0 = t * kGramTileRows;
+                    const int32_t rows = std::min<int32_t>(kGramTileRows, n_rows - r0);
+                    auto B_blk = B.middleRows(r0, rows);
+                    auto S_blk = S_tile.topRows(rows);
+                    for (int32_t r = 0; r < rows; ++r) {
+                        S_blk.row(r) = inv_d[r0 + r] * B_blk.row(r);
+                    }
+                    g_part[static_cast<size_t>(t)].noalias() = B_blk.transpose() * S_blk;
+                }
+            }
+            for (int32_t t = 0; t < n_tiles; ++t) {
+                G.noalias() += g_part[static_cast<size_t>(t)];
+            }
+            return;
+        }
         for (int32_t r0 = 0; r0 < n_rows; r0 += kGramTileRows) {
             const int32_t rows = std::min<int32_t>(kGramTileRows, n_rows - r0);
             auto B_blk = B.middleRows(r0, rows);
@@ -523,93 +570,176 @@ struct FastFAM::BinSparseLDLT {
         }
     }
 
-    double evalLogL(const double * __restrict w_s, const double * __restrict w_r_perm,
-                    double cur_tao, Workspace &ws) const {
+    bool evalGramAndLogdet(const double * __restrict w_s, const double * __restrict w_r_perm,
+                           double cur_tao, Workspace &ws, double &out_logdet_v) const {
         ws.is_diag_only = (cur_tao == 0.0);
         const int32_t c = n_covar;
         const int32_t m = c + 1;
 
-        // 1. Factorize the smaller related submatrix first so any non-PD grid point exits
-        // immediately before touching singletons.
         double logdet_r = 0.0;
         if (n > 0) {
             if (!factorizeRelatedOnly(w_r_perm, cur_tao, ws, logdet_r)) {
-                return -std::numeric_limits<double>::infinity();
+                return false;
             }
         }
 
         ws.G.setZero(m, m);
 
-        // 2. Single-pass L1-tiled singleton evaluation: fuse d = w_s + tao * k_s,
-        // vectorized log(d), and weighted Gram accumulation without L2/DRAM round-trips.
+        bool use_inner_omp = false;
+#ifdef _OPENMP
+        use_inner_omp = (omp_in_parallel() == 0 && omp_get_max_threads() > 1);
+#endif
+
         double logdet_s = 0.0;
         if (n_s > 0) {
             const double * __restrict kd_s = k_diag_s.data();
-            double d_tile[kGramTileRows];
             const bool guaranteed_pos = (ws.is_diag_only && min_w_s > 0.0) ||
                 (cur_tao > 0.0 && min_w_s + cur_tao * min_k_diag_s > 0.0) ||
                 (cur_tao < 0.0 && min_w_s + cur_tao * max_k_diag_s > 0.0);
 
-            for (int32_t r0 = 0; r0 < n_s; r0 += kGramTileRows) {
-                const int32_t rows = std::min<int32_t>(kGramTileRows, n_s - r0);
-                auto B_blk = B_s.middleRows(r0, rows);
-                auto S_blk = ws.scaled_tile.topRows(rows);
-
-                if (ws.is_diag_only) {
-                    if (!guaranteed_pos) {
+            if (use_inner_omp && n_s >= 4096) {
+                const int32_t n_tiles = (n_s + kGramTileRows - 1) / kGramTileRows;
+                vector<MatrixXd> g_part(static_cast<size_t>(n_tiles));
+                vector<double> ld_part(static_cast<size_t>(n_tiles), 0.0);
+                int any_bad = 0;
+                ScopedSingleThreadBLAS blas_guard;
+                #pragma omp parallel
+                {
+                    ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                    RowMatrixXd S_tile(kGramTileRows, m);
+                    double d_tile[kGramTileRows];
+                    #pragma omp for schedule(static) reduction(|:any_bad)
+                    for (int32_t t = 0; t < n_tiles; ++t) {
+                        const int32_t r0 = t * kGramTileRows;
+                        const int32_t rows = std::min<int32_t>(kGramTileRows, n_s - r0);
+                        auto B_blk = B_s.middleRows(r0, rows);
+                        auto S_blk = S_tile.topRows(rows);
+                        int loc_bad = 0;
+                        if (ws.is_diag_only) {
+                            if (!guaranteed_pos) {
+                                for (int32_t r = 0; r < rows; ++r) {
+                                    const double d = w_s[r0 + r];
+                                    if (!(d > 0.0)) { loc_bad = 1; break; }
+                                    d_tile[r] = d;
+                                }
+                            } else {
+                                std::memcpy(d_tile, w_s + r0, static_cast<size_t>(rows) * sizeof(double));
+                            }
+                        } else if (guaranteed_pos) {
+                            for (int32_t r = 0; r < rows; ++r) {
+                                d_tile[r] = w_s[r0 + r] + cur_tao * kd_s[r0 + r];
+                            }
+                        } else {
+                            for (int32_t r = 0; r < rows; ++r) {
+                                const double d = w_s[r0 + r] + cur_tao * kd_s[r0 + r];
+                                if (!(d > 0.0)) { loc_bad = 1; break; }
+                                d_tile[r] = d;
+                            }
+                        }
+                        if (loc_bad) {
+                            any_bad |= 1;
+                        } else {
+                            Map<const Eigen::ArrayXd> d_arr(d_tile, rows);
+                            ld_part[static_cast<size_t>(t)] = d_arr.log().sum();
+                            for (int32_t r = 0; r < rows; ++r) {
+                                S_blk.row(r) = (1.0 / d_tile[r]) * B_blk.row(r);
+                            }
+                            g_part[static_cast<size_t>(t)].noalias() = B_blk.transpose() * S_blk;
+                        }
+                    }
+                }
+                if (any_bad) return false;
+                for (int32_t t = 0; t < n_tiles; ++t) {
+                    logdet_s += ld_part[static_cast<size_t>(t)];
+                    ws.G.noalias() += g_part[static_cast<size_t>(t)];
+                }
+            } else {
+                double d_tile[kGramTileRows];
+                for (int32_t r0 = 0; r0 < n_s; r0 += kGramTileRows) {
+                    const int32_t rows = std::min<int32_t>(kGramTileRows, n_s - r0);
+                    auto B_blk = B_s.middleRows(r0, rows);
+                    auto S_blk = ws.scaled_tile.topRows(rows);
+                    if (ws.is_diag_only) {
+                        if (!guaranteed_pos) {
+                            for (int32_t r = 0; r < rows; ++r) {
+                                const double d = w_s[r0 + r];
+                                if (!(d > 0.0)) return false;
+                                d_tile[r] = d;
+                            }
+                        } else {
+                            std::memcpy(d_tile, w_s + r0, static_cast<size_t>(rows) * sizeof(double));
+                        }
+                    } else if (guaranteed_pos) {
                         for (int32_t r = 0; r < rows; ++r) {
-                            const double d = w_s[r0 + r];
-                            if (!(d > 0.0)) return -std::numeric_limits<double>::infinity();
-                            d_tile[r] = d;
+                            d_tile[r] = w_s[r0 + r] + cur_tao * kd_s[r0 + r];
                         }
                     } else {
-                        std::memcpy(d_tile, w_s + r0, static_cast<size_t>(rows) * sizeof(double));
+                        for (int32_t r = 0; r < rows; ++r) {
+                            const double d = w_s[r0 + r] + cur_tao * kd_s[r0 + r];
+                            if (!(d > 0.0)) return false;
+                            d_tile[r] = d;
+                        }
                     }
-                } else if (guaranteed_pos) {
+                    Map<const Eigen::ArrayXd> d_arr(d_tile, rows);
+                    logdet_s += d_arr.log().sum();
                     for (int32_t r = 0; r < rows; ++r) {
-                        d_tile[r] = w_s[r0 + r] + cur_tao * kd_s[r0 + r];
+                        S_blk.row(r) = (1.0 / d_tile[r]) * B_blk.row(r);
                     }
-                } else {
-                    for (int32_t r = 0; r < rows; ++r) {
-                        const double d = w_s[r0 + r] + cur_tao * kd_s[r0 + r];
-                        if (!(d > 0.0)) return -std::numeric_limits<double>::infinity();
-                        d_tile[r] = d;
-                    }
+                    ws.G.noalias() += B_blk.transpose() * S_blk;
                 }
-
-                Map<const Eigen::ArrayXd> d_arr(d_tile, rows);
-                logdet_s += d_arr.log().sum();
-                for (int32_t r = 0; r < rows; ++r) {
-                    const double inv_d = 1.0 / d_tile[r];
-                    S_blk.row(r) = inv_d * B_blk.row(r);
-                }
-                ws.G.noalias() += B_blk.transpose() * S_blk;
             }
             if (!std::isfinite(logdet_s)) {
-                return -std::numeric_limits<double>::infinity();
+                return false;
             }
         }
 
-        // 3. Forward half-solve and Gram accumulation on the related submatrix
         if (n > 0) {
             if (ws.is_diag_only || nnz_L == 0) {
                 accumulateWeightedGram(B_r_perm, ws.inv_diag.data(), n, m, ws.scaled_tile, ws.G);
             } else {
-                ws.U_r = B_r_perm;
                 const int32_t * __restrict lp = Lp.data();
                 const int32_t * __restrict li = Li.data();
                 const double * __restrict Lx = ws.Lx.data();
-                double * __restrict u_data = ws.U_r.data();
-                for (int32_t i = 0; i < n; ++i) {
-                    const int32_t p_start = lp[i];
-                    const int32_t p_end = lp[i + 1];
-                    if (p_start == p_end) continue;
-                    const double * __restrict u_i = u_data + static_cast<size_t>(i) * m;
-                    for (int32_t p = p_start; p < p_end; ++p) {
-                        const double l_val = Lx[p];
-                        double * __restrict u_dst = u_data + static_cast<size_t>(li[p]) * m;
+                if (use_inner_omp && n >= 4096 && m >= 2) {
+                    double * __restrict u_out = ws.U_r.data();
+                    const double * __restrict b_in = B_r_perm.data();
+                    #pragma omp parallel
+                    {
+                        vector<double> u_col(static_cast<size_t>(n));
+                        double * __restrict uc = u_col.data();
+                        #pragma omp for schedule(static)
                         for (int32_t col = 0; col < m; ++col) {
-                            u_dst[col] -= l_val * u_i[col];
+                            for (int32_t i = 0; i < n; ++i) {
+                                uc[i] = b_in[static_cast<size_t>(i) * m + col];
+                            }
+                            for (int32_t i = 0; i < n; ++i) {
+                                const int32_t p_start = lp[i];
+                                const int32_t p_end = lp[i + 1];
+                                if (p_start == p_end) continue;
+                                const double ui = uc[i];
+                                for (int32_t p = p_start; p < p_end; ++p) {
+                                    uc[li[p]] -= Lx[p] * ui;
+                                }
+                            }
+                            for (int32_t i = 0; i < n; ++i) {
+                                u_out[static_cast<size_t>(i) * m + col] = uc[i];
+                            }
+                        }
+                    }
+                } else {
+                    ws.U_r = B_r_perm;
+                    double * __restrict u_data = ws.U_r.data();
+                    for (int32_t i = 0; i < n; ++i) {
+                        const int32_t p_start = lp[i];
+                        const int32_t p_end = lp[i + 1];
+                        if (p_start == p_end) continue;
+                        const double * __restrict u_i = u_data + static_cast<size_t>(i) * m;
+                        for (int32_t p = p_start; p < p_end; ++p) {
+                            const double l_val = Lx[p];
+                            double * __restrict u_dst = u_data + static_cast<size_t>(li[p]) * m;
+                            for (int32_t col = 0; col < m; ++col) {
+                                u_dst[col] -= l_val * u_i[col];
+                            }
                         }
                     }
                 }
@@ -617,6 +747,17 @@ struct FastFAM::BinSparseLDLT {
             }
         }
 
+        out_logdet_v = logdet_s + logdet_r;
+        return std::isfinite(out_logdet_v);
+    }
+
+    double evalLogL(const double * __restrict w_s, const double * __restrict w_r_perm,
+                    double cur_tao, Workspace &ws) const {
+        double logdet_v = 0.0;
+        if (!evalGramAndLogdet(w_s, w_r_perm, cur_tao, ws, logdet_v)) {
+            return -std::numeric_limits<double>::infinity();
+        }
+        const int32_t c = n_covar;
         ws.XtVX = ws.G.topLeftCorner(c, c);
         Eigen::ColPivHouseholderQR<MatrixXd> XtVX_solver(ws.XtVX);
         if (!XtVX_solver.isInvertible()) {
@@ -627,7 +768,130 @@ struct FastFAM::BinSparseLDLT {
         const VectorXd beta_hat = XtVX_solver.solve(XtVY);
         const double yPy = ws.G(c, c) - XtVY.dot(beta_hat);
 
-        return -0.5 * (logdet_s + logdet_r + logdet_XtVX + yPy);
+        return -0.5 * (logdet_v + logdet_XtVX + yPy);
+    }
+
+    // Zero-ViX BLUP step: solves for fixed effects out_a via L^{-1}[X, Y] Gram matrix
+    // and computes out_eta = Y - w .* V^{-1}(Y - X * out_a) using ONE single-vector sparse solve.
+    bool solveBlupStep(const Ref<const MatrixXd> &X,
+                       const Ref<const VectorXd> &in_var_mu,
+                       const Ref<const VectorXd> &in_Y,
+                       double cur_tao,
+                       vector<double> &v_s,
+                       vector<double> &v_r_perm,
+                       VectorXd &out_a,
+                       VectorXd &out_eta) {
+        updateWorkingState(in_var_mu, in_Y, v_s, v_r_perm);
+        double logdet_v = 0.0;
+        if (!evalGramAndLogdet(v_s.data(), v_r_perm.data(), cur_tao, main_ws, logdet_v)) {
+            return false;
+        }
+        const int32_t c = n_covar;
+        main_ws.XtVX = main_ws.G.topLeftCorner(c, c);
+        Eigen::ColPivHouseholderQR<MatrixXd> XtVX_solver(main_ws.XtVX);
+        if (!XtVX_solver.isInvertible()) {
+            return false;
+        }
+        out_a = XtVX_solver.solve(main_ws.G.block(0, c, c, 1));
+        if (!out_a.array().isFinite().all()) {
+            return false;
+        }
+
+        out_eta.resize(n_total);
+        double * __restrict eta_dst = out_eta.data();
+        const double * __restrict y_src = in_Y.data();
+        const double * __restrict w_src = in_var_mu.data();
+
+        // Singletons: eta_i = Y_i - w_i * (Y_i - x_i' a) / (w_i + tao * k_ii)
+        if (n_s > 0) {
+            const int32_t * __restrict so = s_orig.data();
+            const double * __restrict ws_arr = v_s.data();
+            const double * __restrict kd_s = k_diag_s.data();
+            ScopedSingleThreadBLAS blas_guard;
+            #pragma omp parallel if(n_s >= 4096)
+            {
+                ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                VectorXd r_tile(kGramTileRows);
+                #pragma omp for schedule(static)
+                for (int32_t r0 = 0; r0 < n_s; r0 += kGramTileRows) {
+                    const int32_t rows = std::min<int32_t>(kGramTileRows, n_s - r0);
+                    auto rt = r_tile.head(rows);
+                    rt.noalias() = B_s.block(r0, c, rows, 1) - B_s.block(r0, 0, rows, c) * out_a;
+                    if (cur_tao == 0.0) {
+                        for (int32_t r = 0; r < rows; ++r) {
+                            const int32_t idx = so[r0 + r];
+                            eta_dst[idx] = y_src[idx] - rt[r];
+                        }
+                    } else {
+                        for (int32_t r = 0; r < rows; ++r) {
+                            const int32_t s = r0 + r;
+                            const int32_t idx = so[s];
+                            const double d = ws_arr[s] + cur_tao * kd_s[s];
+                            eta_dst[idx] = y_src[idx] - ws_arr[s] * (rt[r] / d);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Relateds: single-vector forward + diagonal + backward solve on r_perm = Y_r - X_r * out_a
+        if (n > 0) {
+            double * __restrict dst = main_ws.solve_vec.data();
+            {
+                ScopedSingleThreadBLAS blas_guard;
+                #pragma omp parallel if(n >= 4096)
+                {
+                    ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                    VectorXd r_tile(kGramTileRows);
+                    #pragma omp for schedule(static)
+                    for (int32_t r0 = 0; r0 < n; r0 += kGramTileRows) {
+                        const int32_t rows = std::min<int32_t>(kGramTileRows, n - r0);
+                        auto rt = r_tile.head(rows);
+                        rt.noalias() = B_r_perm.block(r0, c, rows, 1) - B_r_perm.block(r0, 0, rows, c) * out_a;
+                        std::memcpy(dst + r0, rt.data(), static_cast<size_t>(rows) * sizeof(double));
+                    }
+                }
+            }
+            const int32_t * __restrict rpo = r_perm_orig.data();
+            const double * __restrict inv_diag = main_ws.inv_diag.data();
+            if (main_ws.is_diag_only || nnz_L == 0) {
+                #pragma omp parallel for schedule(static) if(n >= 4096)
+                for (int32_t k = 0; k < n; ++k) {
+                    const int32_t idx = rpo[k];
+                    eta_dst[idx] = y_src[idx] - w_src[idx] * (dst[k] * inv_diag[k]);
+                }
+            } else {
+                const int32_t * __restrict lp = Lp.data();
+                const int32_t * __restrict li = Li.data();
+                const double * __restrict Lx = main_ws.Lx.data();
+                for (int32_t i = 0; i < n; ++i) {
+                    const double tmp = dst[i];
+                    if (tmp != 0.0) {
+                        for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                            dst[li[p]] -= tmp * Lx[p];
+                        }
+                    }
+                }
+                for (int32_t i = 0; i < n; ++i) {
+                    dst[i] *= inv_diag[i];
+                }
+                for (int32_t i = n - 1; i >= 0; --i) {
+                    double tmp = dst[i];
+                    for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
+                        tmp -= Lx[p] * dst[li[p]];
+                    }
+                    dst[i] = tmp;
+                }
+                #pragma omp parallel for schedule(static) if(n >= 4096)
+                for (int32_t k = 0; k < n; ++k) {
+                    const int32_t idx = rpo[k];
+                    eta_dst[idx] = y_src[idx] - w_src[idx] * dst[k];
+                }
+            }
+        }
+
+        (void)X;
+        return out_eta.array().isFinite().all();
     }
 
     // Exact REML logL(0), right-hand score d(logL)/d(tao)|_{tao=0}, and Fisher information I(0)
@@ -802,12 +1066,26 @@ struct FastFAM::BinSparseLDLT {
             RowMatrixXd M_r(n, c);
             auto X_r = B_r_perm.leftCols(c);
             auto y_r = B_r_perm.col(c);
-            r_r.noalias() = y_r - X_r * beta0;
-            for (int32_t k = 0; k < n; ++k) {
-                const double inv_d = 1.0 / w_r_perm[k];
-                inv_dr[k] = inv_d;
-                r_r[k] *= inv_d;
-                M_r.row(k) = inv_d * X_r.row(k);
+            {
+                ScopedSingleThreadBLAS blas_guard;
+                #pragma omp parallel if(n >= 4096)
+                {
+                    ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                    VectorXd r_tile(kGramTileRows);
+                    #pragma omp for schedule(static)
+                    for (int32_t r0 = 0; r0 < n; r0 += kGramTileRows) {
+                        const int32_t rows = std::min<int32_t>(kGramTileRows, n - r0);
+                        auto rt = r_tile.head(rows);
+                        rt.noalias() = y_r.segment(r0, rows) - X_r.middleRows(r0, rows) * beta0;
+                        for (int32_t r = 0; r < rows; ++r) {
+                            const int32_t k = r0 + r;
+                            const double inv_d = 1.0 / w_r_perm[k];
+                            inv_dr[k] = inv_d;
+                            r_r[k] = inv_d * rt[r];
+                            M_r.row(k) = inv_d * X_r.row(k);
+                        }
+                    }
+                }
             }
 
             VectorXd q_r = VectorXd::Zero(n);
@@ -842,13 +1120,35 @@ struct FastFAM::BinSparseLDLT {
             rKr += r_r.dot(q_r);
             tr_DinvK += loc_tr1;
             tr_DinvK2 += loc_tr2;
-            MtKM.noalias() += M_r.transpose() * Q_r;
 
-            RowMatrixXd DinvQ_r(n, c);
-            for (int32_t k = 0; k < n; ++k) {
-                DinvQ_r.row(k) = idr[k] * Q_r.row(k);
+            const int32_t n_rtiles = (n + kGramTileRows - 1) / kGramTileRows;
+            vector<MatrixXd> mtkm_r(static_cast<size_t>(n_rtiles));
+            vector<MatrixXd> qtdq_r(static_cast<size_t>(n_rtiles));
+            {
+                ScopedSingleThreadBLAS blas_guard;
+                #pragma omp parallel if(n >= 4096)
+                {
+                    ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                    RowMatrixXd S_tile(kGramTileRows, c);
+                    #pragma omp for schedule(static)
+                    for (int32_t t = 0; t < n_rtiles; ++t) {
+                        const int32_t r0 = t * kGramTileRows;
+                        const int32_t rows = std::min<int32_t>(kGramTileRows, n - r0);
+                        auto M_blk = M_r.middleRows(r0, rows);
+                        auto Q_blk = Q_r.middleRows(r0, rows);
+                        auto S_blk = S_tile.topRows(rows);
+                        mtkm_r[static_cast<size_t>(t)].noalias() = M_blk.transpose() * Q_blk;
+                        for (int32_t r = 0; r < rows; ++r) {
+                            S_blk.row(r) = idr[r0 + r] * Q_blk.row(r);
+                        }
+                        qtdq_r[static_cast<size_t>(t)].noalias() = Q_blk.transpose() * S_blk;
+                    }
+                }
             }
-            QtDinvQ.noalias() += Q_r.transpose() * DinvQ_r;
+            for (int32_t t = 0; t < n_rtiles; ++t) {
+                MtKM.noalias() += mtkm_r[static_cast<size_t>(t)];
+                QtDinvQ.noalias() += qtdq_r[static_cast<size_t>(t)];
+            }
         }
 
         const MatrixXd C0_MtKM = C0 * MtKM;
@@ -5226,34 +5526,77 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
     VectorXd var_mu_i;
     VectorXd Y;
     updateLogisticWorkingFromEta(Xa_b, phenoVec, mu, var_mu_i, Y);
-    LOGGER << "Initial Var(Y): " << varVector(Y) << std::endl;
-    
-    double cur_tao = options_d["tao_start"] * varVector(Y); 
+    const double init_varY = varVector(Y);
+    LOGGER << "Initial Var(Y): " << init_varY << std::endl;
 
-    {
-        // test the tao val
-        binSolverV->permuteWeights(var_mu_i, w_s, w_r_perm);
-        double logdet_init = 0.0;
-        if(!binSolverV->factorize(w_s.data(), w_r_perm.data(), cur_tao, binSolverV->main_ws, logdet_init)){
+    auto run_blup_step = [&](double tao_val,
+                             const Ref<const VectorXd> &in_var_mu,
+                             const Ref<const VectorXd> &in_Y,
+                             VectorXd &out_a,
+                             VectorXd &out_eta) -> bool {
+        return binSolverV->solveBlupStep(covar, in_var_mu, in_Y, tao_val, w_s, w_r_perm, out_a, out_eta);
+    };
+
+    auto polish_pirls_at_tao = [&](double tao_val,
+                                   Ref<VectorXd> io_a,
+                                   VectorXd &io_eta,
+                                   VectorXd &io_mu,
+                                   VectorXd &io_var_mu,
+                                   VectorXd &io_Y,
+                                   int max_polish_steps) -> bool {
+        for (int p_it = 0; p_it < max_polish_steps; ++p_it) {
+            VectorXd cand_a, cand_eta;
+            if (!run_blup_step(tao_val, io_var_mu, io_Y, cand_a, cand_eta)) {
+                return false;
+            }
+            const double max_deta = (cand_eta - io_eta).lpNorm<Eigen::Infinity>();
+            double damp = 1.0;
+            if (max_deta > 2.5) {
+                damp = std::max(0.35, 2.5 / max_deta);
+            }
+            io_a = io_a + damp * (cand_a - io_a);
+            io_eta = io_eta + damp * (cand_eta - io_eta);
+            updateLogisticWorkingFromEta(io_eta, phenoVec, io_mu, io_var_mu, io_Y);
+            if (max_deta < 1e-3 && damp == 1.0) {
+                break;
+            }
+        }
+        return true;
+    };
+
+    double cur_tao = options_d["tao_start"] * init_varY;
+    bool have_init_zero_score = false;
+    double cached_ll0 = 0.0, cached_s0 = 0.0, cached_f0 = 0.0;
+    if (options_d["tao_start"] == 0.0) {
+        // Compute exact REML score & Fisher info at tao = 0 to warm-start tao^(0)
+        binSolverV->updateWorkingState(var_mu_i, Y, w_s, w_r_perm);
+        if (binSolverV->evalZeroTaoScoreAndInfo(w_s.data(), w_r_perm.data(), cached_ll0, cached_s0, cached_f0)) {
+            have_init_zero_score = true;
+            if (cached_s0 > 0.0 && cached_f0 > 1e-30) {
+                const double raw_fs = cached_s0 / cached_f0;
+                // Padé logit-curvature attenuation prevents initial Fisher-scoring overshoot on rare traits
+                double warm_tao = std::min(0.5 * init_varY, raw_fs / (1.0 + 0.45 * raw_fs));
+                for (int try_k = 0; try_k < 10 && warm_tao > 1e-8; ++try_k) {
+                    double ld_try = 0.0;
+                    if (binSolverV->factorizeRelatedOnly(w_r_perm.data(), warm_tao, binSolverV->main_ws, ld_try) &&
+                        (binSolverV->n_s == 0 || binSolverV->min_w_s + warm_tao * binSolverV->min_k_diag_s > 0.0)) {
+                        cur_tao = warm_tao;
+                        break;
+                    }
+                    warm_tao *= 0.5;
+                }
+            }
+        }
+    }
+
+    bool state_modified_at_init = false;
+    if (cur_tao > 0.0 || options_d["tao_start"] != 0.0) {
+        if (!polish_pirls_at_tao(cur_tao, est_a, Xa_b, mu, var_mu_i, Y, 4)) {
             LOGGER.e(0, "can't invert the V matrix!");
         }
-
-        binSolverV->solveMatrix(covar, ViX, binSolverV->main_ws); // n*c
-
-        auto XtVX_solver = parallelAtB(covar, ViX).colPivHouseholderQr();
-        if(!XtVX_solver.isInvertible()){
-            LOGGER.e(0, "the XtViX matrix is not invertible.");
-        }
-
-        VectorXd ViY;
-        binSolverV->solveVector(Y, ViY, binSolverV->main_ws);
-  
-        est_a = XtVX_solver.solve(parallelAtVec(ViX, Y));
-        Xa_b = Y.array() - var_mu_i.array() * (ViY - ViX * est_a).array();
-        updateLogisticWorkingFromEta(Xa_b, phenoVec, mu, var_mu_i, Y);
-
-        LOGGER << "Initializing with tao: " << cur_tao << ", Var(Y): " << varVector(Y) << cur_tao << ", fixed effects: " << est_a.transpose() << "." << std::endl;
+        state_modified_at_init = true;
     }
+    LOGGER << "Initializing with tao: " << cur_tao << ", Var(Y): " << varVector(Y) << ", fixed effects: " << est_a.transpose() << "." << std::endl;
  
 
     bool b_reml = false;
@@ -5276,6 +5619,8 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
     double tol = 5e-5;
     double abTol = 1e-6;
     int numAbTol = 0;
+    const double init_tao_ref = cur_tao;
+    double saved_tao_scale = 0.0;
     vector<double> hisTao(maxIter);
     int max_omp_threads = 1;
 #ifdef _OPENMP
@@ -5293,10 +5638,15 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
             tid = omp_get_thread_num();
 #endif
             if (tid < max_omp_threads) {
-                thread_ws[tid].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
+                thread_ws[tid].initEval(binSolverV->n, binSolverV->nnz_L, n_cols_aug);
             }
         }
     }
+
+    bool has_prev_fp = false;
+    double prev_fp_tao = 0.0;
+    double prev_fp_res = 0.0;
+    bool prev_was_secant = false;
 
     while(curIter < maxIter && (!bConverge) && numAbTol < 5){
         LOGGER << "------------------------------------" << std::endl;
@@ -5305,7 +5655,7 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         binSolverV->updateWorkingState(var_mu_i, Y, w_s, w_r_perm);
 
         double varY = varVector(Y);
-        const double max_tao_limit = varY * 1.01;
+        const double max_tao_limit = std::max(varY * 1.01, pre_tao * 2.0);
         int total_infeasible = 0;
         int total_points = 0;
 
@@ -5378,7 +5728,7 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
                             int old_sz = static_cast<int>(thread_ws.size());
                             thread_ws.resize(active_threads);
                             for (int t = old_sz; t < active_threads; ++t) {
-                                thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
+                                thread_ws[t].initEval(binSolverV->n, binSolverV->nnz_L, n_cols_aug);
                             }
                         }
 #endif
@@ -5406,20 +5756,38 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
             }
         };
 
-        // 1. Exact logL(0), score(0), and Fisher info I(0) at tao = 0
+        // 1. Exact logL(0), score(0), and Fisher info I(0) at tao = 0 when needed
         double logL_0 = -std::numeric_limits<double>::infinity();
-        double score_0 = 0.0;
+        double score_0 = 1.0;
         double fisher_0 = 0.0;
-        if (binSolverV->evalZeroTaoScoreAndInfo(w_s.data(), w_r_perm.data(), logL_0, score_0, fisher_0)) {
-            insert_cached(0.0, logL_0);
-        } else {
-            logL_0 = eval_single(0.0);
+        bool evaled_zero = false;
+        auto ensure_zero_eval = [&]() {
+            if (evaled_zero) return;
+            evaled_zero = true;
+            if (curIter == 0 && !state_modified_at_init && have_init_zero_score) {
+                logL_0 = cached_ll0;
+                score_0 = cached_s0;
+                fisher_0 = cached_f0;
+                insert_cached(0.0, logL_0);
+            } else if (binSolverV->evalZeroTaoScoreAndInfo(w_s.data(), w_r_perm.data(), logL_0, score_0, fisher_0)) {
+                insert_cached(0.0, logL_0);
+            } else {
+                logL_0 = eval_single(0.0);
+                score_0 = 0.0;
+                fisher_0 = 0.0;
+            }
+        };
+
+        if (curIter == 0 || pre_tao == 0.0 || saved_tao_scale <= 0.0) {
+            ensure_zero_eval();
+            const double fs_t = (fisher_0 > 1e-30 && score_0 > 0.0) ? (score_0 / fisher_0) : 0.0;
+            const double info_sc = (fisher_0 > 1e-30) ? (1.0 / std::sqrt(fisher_0)) : (0.01 * max_tao_limit);
+            saved_tao_scale = std::max(1e-8, std::min(max_tao_limit, std::max(fs_t, info_sc)));
         }
 
-        const double fs_tao = (fisher_0 > 1e-30 && score_0 > 0.0) ? (score_0 / fisher_0) : 0.0;
-        const double info_scale = (fisher_0 > 1e-30) ? (1.0 / std::sqrt(fisher_0)) : (0.01 * max_tao_limit);
-        const double tao_scale = std::max(1e-8, std::min(max_tao_limit, std::max(fs_tao, info_scale)));
-        const int wave_width = std::max(16, ((16 + max_omp_threads - 1) / max_omp_threads) * max_omp_threads);
+        const double fs_tao = (evaled_zero && fisher_0 > 1e-30 && score_0 > 0.0) ? (score_0 / fisher_0) : pre_tao;
+        const double tao_scale = std::min(max_tao_limit, saved_tao_scale);
+        const int wave_width = 10;
 
         auto make_uniform_grid = [](double lo, double hi, int count, vector<double> &grid) {
             grid.clear();
@@ -5435,26 +5803,45 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
             grid.back() = hi;
         };
 
-        // 2. Thread-adaptive bracketing
+        // 2. Deterministic parallel bracketing coupled to warm-start / outer PQL trajectory
         if (curIter == 0) {
-            const int coarse_width = std::max(32, ((32 + max_omp_threads - 1) / max_omp_threads) * max_omp_threads);
-            const int n_low = coarse_width / 2;
-            const int n_high = coarse_width - n_low;
-            const double pivot = std::min(max_tao_limit * 0.25, std::max(8.0 * tao_scale, 1e-4 * max_tao_limit));
-
             vector<double> cands;
-            cands.reserve(coarse_width + 2);
-            cands.push_back(0.0);
-            if (fs_tao > 0.0 && fs_tao < max_tao_limit) {
-                cands.push_back(fs_tao);
-            }
-            for (int i = 1; i <= n_low; ++i) {
-                const double frac = static_cast<double>(i) / static_cast<double>(n_low);
-                cands.push_back(pivot * frac * frac);
-            }
-            for (int i = 1; i <= n_high; ++i) {
-                const double frac = static_cast<double>(i) / static_cast<double>(n_high);
-                cands.push_back(pivot + (max_tao_limit - pivot) * frac);
+            if (pre_tao > 0.0 && pre_tao < max_tao_limit) {
+                const int n_near = wave_width + 2;
+                const int n_far = wave_width - 2;
+                cands.reserve(n_near + n_far + 4);
+                cands.push_back(0.0);
+                cands.push_back(pre_tao);
+                if (fs_tao > 0.0 && fs_tao < max_tao_limit) cands.push_back(fs_tao);
+                const double near_hi = std::min(max_tao_limit, std::max(2.5 * pre_tao, 2.0 * tao_scale));
+                for (int i = 1; i <= n_near; ++i) {
+                    const double frac = static_cast<double>(i) / static_cast<double>(n_near);
+                    cands.push_back(near_hi * frac);
+                }
+                if (near_hi < max_tao_limit) {
+                    for (int i = 1; i <= n_far; ++i) {
+                        const double frac = static_cast<double>(i) / static_cast<double>(n_far);
+                        cands.push_back(near_hi + (max_tao_limit - near_hi) * frac * frac);
+                    }
+                }
+            } else {
+                const int coarse_width = 2 * wave_width;
+                const int n_low = coarse_width / 2;
+                const int n_high = coarse_width - n_low;
+                const double pivot = std::min(max_tao_limit * 0.25, std::max(8.0 * tao_scale, 1e-4 * max_tao_limit));
+                cands.reserve(coarse_width + 3);
+                cands.push_back(0.0);
+                if (fs_tao > 0.0 && fs_tao < max_tao_limit) {
+                    cands.push_back(fs_tao);
+                }
+                for (int i = 1; i <= n_low; ++i) {
+                    const double frac = static_cast<double>(i) / static_cast<double>(n_low);
+                    cands.push_back(pivot * frac * frac);
+                }
+                for (int i = 1; i <= n_high; ++i) {
+                    const double frac = static_cast<double>(i) / static_cast<double>(n_high);
+                    cands.push_back(pivot + (max_tao_limit - pivot) * frac);
+                }
             }
             LOGGER << "Fine tuning within 0 ~ " << max_tao_limit << " with adaptive parallel waves (width " << wave_width << ")." << std::endl;
             eval_batch_parallel(cands);
@@ -5467,16 +5854,21 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
                 double z_lo = 0.0;
                 double z_hi = max_tao_limit;
                 if (curIter == 1) {
-                    z_lo = 0.0;
-                    z_hi = std::min(max_tao_limit, std::max(3.5 * center, 2.5 * tao_scale));
+                    const double init_jump = std::abs(hisTao[0] - init_tao_ref);
+                    const double rad1 = std::max(3.0 * init_jump, std::max(0.25 * center, 1e-4 * tao_scale));
+                    z_lo = (center - rad1 < 0.20 * center) ? 0.0 : (center - rad1);
+                    z_hi = std::min(max_tao_limit, center + rad1);
                 } else {
                     const double prev_jump = std::abs(hisTao[curIter - 1] - hisTao[curIter - 2]);
-                    const double rad = std::max(4.0 * prev_jump, std::max(0.20 * center, 1e-5 * std::max(1.0, tao_scale)));
-                    z_lo = (center - rad < 0.25 * center) ? 0.0 : (center - rad);
+                    const double rad = std::max(3.5 * prev_jump, std::max(2.5e-3 * center, 1e-5 * std::max(1.0, tao_scale)));
+                    z_lo = (center - rad < 0.10 * center) ? 0.0 : (center - rad);
                     z_hi = std::min(max_tao_limit, center + rad);
                 }
+                if (z_lo == 0.0) {
+                    ensure_zero_eval();
+                }
                 vector<double> cands;
-                make_uniform_grid(z_lo, z_hi, wave_width, cands);
+                make_uniform_grid(z_lo, z_hi, wave_width + 1, cands);
                 cands.push_back(pre_tao);
                 eval_batch_parallel(cands);
 
@@ -5502,6 +5894,7 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
                         eval_batch_parallel(cands);
                     } else if (z_lo > 0.0 && best_t <= z_lo + 1e-14 * std::max(1.0, z_lo)) {
                         const double new_lo = (z_lo < 0.05 * tao_scale) ? 0.0 : (0.25 * z_lo);
+                        if (new_lo == 0.0) ensure_zero_eval();
                         make_uniform_grid(new_lo, z_lo, wave_width + 1, cands);
                         z_lo = new_lo;
                         eval_batch_parallel(cands);
@@ -5602,6 +5995,10 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
             opt_tao = 0.0;
             opt_logL = logL_0;
         } else if (finite_pts.size() >= 2) {
+            if (best_idx == 0 && !evaled_zero) {
+                ensure_zero_eval();
+                get_best_bracket(best_idx, finite_pts, first_infeas_above);
+            }
             if (best_idx == 0 && score_0 <= 0.0) {
                 const double tiny_t = std::min(0.1 * finite_pts[1].first, 1e-8 * std::max(1.0, tao_scale));
                 const double tiny_ll = eval_single(tiny_t);
@@ -5647,53 +6044,6 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
                     } else {
                         w = b; fw = fb;
                         v = a; fv = fa;
-                    }
-                }
-
-                // Parallel parabolic-centered micro-wave so multi-core runs shrink (a, b)
-                // in a single all-threads wave instead of ~12-15 serial single-thread steps.
-                const double init_tol = 2e-7 * std::max(1.0, std::abs(x)) + 1e-9;
-                if (max_omp_threads >= 4 && (b - a) > 4.0 * init_tol && std::isfinite(fa) && std::isfinite(fb) && a < x && x < b) {
-                    const double xa = x - a;
-                    const double xb = x - b;
-                    const double fxa = fx - fa;
-                    const double fxb = fx - fb;
-                    const double denom_q = 2.0 * (xa * fxb - xb * fxa);
-                    double u_center = x;
-                    if (std::abs(denom_q) > 1e-30) {
-                        const double step_q = -(xa * xa * fxb - xb * xb * fxa) / denom_q;
-                        const double cand_u = x + step_q;
-                        if (cand_u > a + 0.02 * (b - a) && cand_u < b - 0.02 * (b - a)) {
-                            u_center = cand_u;
-                        }
-                    }
-                    const double half_span = std::max(2.0 * init_tol, 0.18 * (b - a));
-                    const double m_lo = std::max(a, u_center - half_span);
-                    const double m_hi = std::min(b, u_center + half_span);
-                    vector<double> micro_cands;
-                    make_uniform_grid(m_lo, m_hi, std::max(8, max_omp_threads), micro_cands);
-                    micro_cands.push_back(u_center);
-                    eval_batch_parallel(micro_cands);
-                    get_best_bracket(best_idx, finite_pts, first_infeas_above);
-
-                    a = (best_idx > 0) ? finite_pts[best_idx - 1].first : 0.0;
-                    fa = (best_idx > 0) ? -finite_pts[best_idx - 1].second : -logL_0;
-                    if (best_idx + 1 < static_cast<int>(finite_pts.size())) {
-                        b = finite_pts[best_idx + 1].first;
-                        fb = -finite_pts[best_idx + 1].second;
-                    } else if (std::isfinite(first_infeas_above)) {
-                        b = first_infeas_above;
-                        fb = std::numeric_limits<double>::infinity();
-                    } else {
-                        b = finite_pts.back().first;
-                        fb = -finite_pts.back().second;
-                    }
-                    x = finite_pts[best_idx].first;
-                    fx = -finite_pts[best_idx].second;
-                    w = x; fw = fx; v = x; fv = fx;
-                    if (std::isfinite(fa) && std::isfinite(fb) && a < x && x < b) {
-                        if (fa <= fb) { w = a; fw = fa; v = b; fv = fb; }
-                        else { w = b; fw = fb; v = a; fv = fa; }
                     }
                 }
 
@@ -5777,44 +6127,106 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
                    << " tao values because V was not positive definite. If the converged tao lies"
                    << " close to the infeasible region, consider a denser or PSD-regularised GRM." << std::endl;
         }
-        cur_tao = opt_tao;
+        const double raw_tao = opt_tao;
+        const double cur_fp_res = raw_tao - pre_tao;
+
+        // First perform the exact, unextrapolated GCTA BLUP update at raw_tao so convergence
+        // is verified strictly against GCTA's exact PQL-REML fixed-point equations.
+        VectorXd raw_a, raw_eta;
+        if (!run_blup_step(raw_tao, var_mu_i, Y, raw_a, raw_eta)) {
+            LOGGER.e(0, "can't invert the V matrix.");
+        }
+        const double raw_max_deta = (raw_eta - Xa_b).lpNorm<Eigen::Infinity>();
+
+        double thresh = ((raw_a - pre_est_a).array().abs() / (raw_a.array().abs() + pre_est_a.array().abs() + tol)).maxCoeff();
+        thresh = std::max(thresh, std::abs((raw_tao - pre_tao) / (raw_tao + pre_tao + tol)) );
+
+        if (thresh < tol) {
+            cur_tao = raw_tao;
+            hisTao[curIter] = cur_tao;
+            est_a = raw_a;
+            Xa_b = raw_eta;
+            updateLogisticWorkingFromEta(Xa_b, phenoVec, mu, var_mu_i, Y);
+            LOGGER << "Iter " << curIter << ", tao: " << cur_tao << ", Var(Y): " << varVector(Y) << ", fixed effects: " << est_a.transpose() << "." << std::endl;
+            bConverge = true;
+            break;
+        }
+
+        // Safeguarded Secant / Steffensen fixed-point acceleration on r(tao) = F(tao) - tao = 0
+        double next_tao = raw_tao;
+        bool used_secant = false;
+        if (has_prev_fp && !prev_was_secant) {
+            const double d_tao = pre_tao - prev_fp_tao;
+            const double d_res = cur_fp_res - prev_fp_res;
+            if (std::abs(d_tao) > 1e-12 && std::abs(d_res) > 1e-14) {
+                const bool oscillating = (cur_fp_res * prev_fp_res < 0.0);
+                const double ratio = cur_fp_res / prev_fp_res;
+                const bool monotone_slow = (cur_fp_res * prev_fp_res > 0.0 && ratio > 0.04 && ratio < 0.995);
+                if (oscillating || monotone_slow) {
+                    double sec_tao = pre_tao - cur_fp_res * (d_tao / d_res);
+                    if (oscillating) {
+                        const double lo_b = std::min(pre_tao, prev_fp_tao);
+                        const double hi_b = std::max(pre_tao, prev_fp_tao);
+                        sec_tao = std::max(lo_b, std::min(hi_b, sec_tao));
+                    } else {
+                        const double max_jump = 5.0 * std::abs(cur_fp_res);
+                        sec_tao = std::max(0.0, std::min(max_tao_limit,
+                                  std::max(raw_tao - max_jump, std::min(raw_tao + max_jump, sec_tao))));
+                    }
+                    if (std::isfinite(sec_tao) && sec_tao >= 0.0 &&
+                        std::abs(sec_tao - raw_tao) > 0.25 * tol * (raw_tao + tol)) {
+                        next_tao = sec_tao;
+                        used_secant = true;
+                    }
+                }
+            }
+        }
+
+        prev_fp_tao = pre_tao;
+        prev_fp_res = cur_fp_res;
+        has_prev_fp = true;
+
+        bool applied_next = false;
+        if (used_secant) {
+            VectorXd sec_a = est_a, sec_eta = Xa_b, sec_mu = mu, sec_v = var_mu_i, sec_Y = Y;
+            if (polish_pirls_at_tao(next_tao, sec_a, sec_eta, sec_mu, sec_v, sec_Y, 3)) {
+                cur_tao = next_tao;
+                est_a = sec_a;
+                Xa_b = sec_eta;
+                mu = sec_mu;
+                var_mu_i = sec_v;
+                Y = sec_Y;
+                prev_was_secant = true;
+                applied_next = true;
+            }
+        }
+
+        if (!applied_next) {
+            cur_tao = raw_tao;
+            prev_was_secant = false;
+            if (raw_max_deta > 2.5) {
+                const double damp = std::max(0.35, 2.5 / raw_max_deta);
+                est_a = est_a + damp * (raw_a - est_a);
+                Xa_b = Xa_b + damp * (raw_eta - Xa_b);
+                updateLogisticWorkingFromEta(Xa_b, phenoVec, mu, var_mu_i, Y);
+                polish_pirls_at_tao(cur_tao, est_a, Xa_b, mu, var_mu_i, Y, 2);
+            } else {
+                est_a = raw_a;
+                Xa_b = raw_eta;
+                updateLogisticWorkingFromEta(Xa_b, phenoVec, mu, var_mu_i, Y);
+                if (raw_max_deta > 0.04 && cur_tao > 0.0) {
+                    polish_pirls_at_tao(cur_tao, est_a, Xa_b, mu, var_mu_i, Y, 2);
+                }
+            }
+        }
+
         hisTao[curIter] = cur_tao;
         if(cur_tao < abTol){
             numAbTol++;
         }else{
             numAbTol = 0;
         }
-        double logdet_iter = 0.0;
-        if(!binSolverV->factorize(w_s.data(), w_r_perm.data(), cur_tao, binSolverV->main_ws, logdet_iter)){
-            LOGGER.e(0, "can't invert the V matrix.");
-        }
-
-        binSolverV->solveMatrix(covar, ViX, binSolverV->main_ws); // n*c
-
-        auto XtVX_solver = parallelAtB(covar, ViX).colPivHouseholderQr();
-        if(!XtVX_solver.isInvertible()){
-            LOGGER.e(0, "XtViX is not invertible.");
-        }
-
-        VectorXd ViY;
-        binSolverV->solveVector(Y, ViY, binSolverV->main_ws);
-  
-        est_a = XtVX_solver.solve(parallelAtVec(ViX, Y));
-        Xa_b = Y.array() - var_mu_i.array() * (ViY - ViX * est_a).array();
-        updateLogisticWorkingFromEta(Xa_b, phenoVec, mu, var_mu_i, Y);
-        //LOGGER << "Tao value: " << cur_tao << ", Var(Y): " << varVector(Y) << std::endl;
-        
-        //his_tao[curIter] = cur_tao;
-        //his_a[curIter] = est_a;
         LOGGER << "Iter " << curIter << ", tao: " << cur_tao << ", Var(Y): " << varVector(Y) << ", fixed effects: " << est_a.transpose() << "." << std::endl;
-
-        double thresh = ((est_a - pre_est_a).array().abs() / (est_a.array().abs() + pre_est_a.array().abs() + tol)).maxCoeff();
-        thresh = std::max(thresh, std::abs((cur_tao - pre_tao) / (cur_tao + pre_tao + tol)) );
-        if(thresh  < tol){
-            bConverge = true;
-            break;
-        }
-
 
         curIter++;
     }
