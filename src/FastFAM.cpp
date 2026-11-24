@@ -4768,53 +4768,169 @@ bool FastFAM::covarGLM(const VectorXd& phenoVec, const MatrixXd& covar, Ref<Vect
 
     const Eigen::Index n_rows = covar.rows();
     const Eigen::Index n_cols = covar.cols();
-    VectorXd theta(n_rows);
-    VectorXd mu(n_rows);
-    VectorXd diags(n_rows);
-    VectorXd resi(n_rows);
+    if (n_rows == 0 || n_cols == 0) {
+        return true;
+    }
+
+    // Warm-start intercept at marginal logit(mean(y)) when starting from zero
+    if (est_beta.squaredNorm() == 0.0) {
+        Eigen::Index intercept_col = -1;
+        const Eigen::Index cand_cols[2] = { n_cols - 1, 0 };
+        for (int ci = 0; ci < 2; ++ci) {
+            const Eigen::Index c_idx = cand_cols[ci];
+            const double * __restrict cp = covar.col(c_idx).data();
+            bool all_ones = true;
+            for (Eigen::Index r = 0; r < n_rows; ++r) {
+                if (cp[r] != 1.0) {
+                    all_ones = false;
+                    break;
+                }
+            }
+            if (all_ones) {
+                intercept_col = c_idx;
+                break;
+            }
+        }
+        if (intercept_col >= 0) {
+            const double y_mean = phenoVec.mean();
+            if (y_mean > 0.0 && y_mean < 1.0) {
+                est_beta[intercept_col] = std::log(y_mean / (1.0 - y_mean));
+            }
+        }
+    }
+
+    const Eigen::Index kTile = 512;
+    const Eigen::Index n_tiles = (n_rows + kTile - 1) / kTile;
+    vector<double> ll_partials(static_cast<size_t>(n_tiles), 0.0);
+    vector<MatrixXd> xtwx_partials(static_cast<size_t>(n_tiles));
+    vector<VectorXd> comp2_partials(static_cast<size_t>(n_tiles));
+
     MatrixXd XtWX(n_cols, n_cols);
     VectorXd comp2(n_cols);
     VectorXd new_beta(n_cols);
-    const Eigen::Index kTile = 512;
-    MatrixXd scaled_tile(std::min<Eigen::Index>(kTile, n_rows), n_cols);
+
+    auto eval_glm_state = [&](const Ref<const VectorXd> &beta_vec, bool need_derivs, double &out_ll) {
+        ScopedSingleThreadBLAS blas_guard;
+        #pragma omp parallel if(n_rows >= 4096)
+        {
+            ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+            const Eigen::Index max_b = std::min<Eigen::Index>(kTile, n_rows);
+            VectorXd theta_blk(max_b);
+            VectorXd diags_blk(max_b);
+            VectorXd resi_blk(max_b);
+            MatrixXd scaled_blk(max_b, need_derivs ? n_cols : 1);
+
+            #pragma omp for schedule(static)
+            for (Eigen::Index t = 0; t < n_tiles; ++t) {
+                const Eigen::Index r0 = t * kTile;
+                const Eigen::Index rows = std::min<Eigen::Index>(kTile, n_rows - r0);
+                auto X_blk = covar.middleRows(r0, rows);
+                auto th = theta_blk.head(rows);
+                th.noalias() = X_blk * beta_vec;
+
+                const double * __restrict y_ptr = phenoVec.data() + r0;
+                const double * __restrict th_ptr = th.data();
+                double * __restrict d_ptr = diags_blk.data();
+                double * __restrict r_ptr = resi_blk.data();
+
+                double tile_ll = 0.0;
+                for (Eigen::Index r = 0; r < rows; ++r) {
+                    const double eta = th_ptr[r];
+                    const double y_i = y_ptr[r];
+                    const double abs_eta = std::abs(eta);
+                    const double softplus = (eta > 0.0 ? eta : 0.0) + std::log1p(std::exp(-abs_eta));
+                    tile_ll += y_i * eta - softplus;
+                    if (need_derivs) {
+                        const double m = 1.0 / (std::exp(-eta) + 1.0);
+                        d_ptr[r] = m * (1.0 - m);
+                        r_ptr[r] = y_i - m;
+                    }
+                }
+                ll_partials[static_cast<size_t>(t)] = tile_ll;
+                if (need_derivs) {
+                    auto S_blk = scaled_blk.topRows(rows);
+                    S_blk = X_blk.array().colwise() * diags_blk.head(rows).array();
+                    xtwx_partials[static_cast<size_t>(t)].noalias() = X_blk.transpose() * S_blk;
+                    comp2_partials[static_cast<size_t>(t)].noalias() = X_blk.transpose() * resi_blk.head(rows);
+                }
+            }
+        }
+        double total_ll = 0.0;
+        if (need_derivs) {
+            XtWX.setZero();
+            comp2.setZero();
+        }
+        for (Eigen::Index t = 0; t < n_tiles; ++t) {
+            total_ll += ll_partials[static_cast<size_t>(t)];
+            if (need_derivs) {
+                XtWX.noalias() += xtwx_partials[static_cast<size_t>(t)];
+                comp2.noalias() += comp2_partials[static_cast<size_t>(t)];
+            }
+        }
+        out_ll = total_ll;
+    };
+
+    double cur_ll = -std::numeric_limits<double>::infinity();
+    eval_glm_state(est_beta, true, cur_ll);
 
     while(curIter < maxIter){
-       theta.noalias() = covar * est_beta;
-       mu = 1.0 / ((-theta.array()).exp() + 1.0);
-       diags = mu.array() * (-mu.array() + 1.0);
-       resi = phenoVec - mu;
+        auto XtWX_solver = XtWX.colPivHouseholderQr();
+        if(!XtWX_solver.isInvertible()){
+            LOGGER.e(0, "XtWX is not invertible.");
+        }
+        VectorXd step = XtWX_solver.solve(comp2);
+        if (!step.array().isFinite().all()) {
+            break;
+        }
 
-       XtWX.setZero();
-       for(Eigen::Index r0 = 0; r0 < n_rows; r0 += kTile){
-           const Eigen::Index rows = std::min<Eigen::Index>(kTile, n_rows - r0);
-           auto X_blk = covar.middleRows(r0, rows);
-           auto S_blk = scaled_tile.topRows(rows);
-           S_blk = X_blk.array().colwise() * diags.segment(r0, rows).array();
-           XtWX.noalias() += X_blk.transpose() * S_blk;
-       }
-       comp2.noalias() = covar.transpose() * resi;
+        double alpha = 1.0;
+        new_beta = est_beta + step;
+        double next_ll = -std::numeric_limits<double>::infinity();
+        const double raw_thresh = ((est_beta - new_beta).array().abs() /
+                                   (est_beta.array().abs() + new_beta.array().abs() + 1e-12)).maxCoeff();
 
-       auto XtWX_solver = XtWX.colPivHouseholderQr();
-       if(!XtWX_solver.isInvertible()){
-           LOGGER.e(0, "XtWX is not invertible.");
-       }
-       VectorXd comp1_2 = XtWX_solver.solve(comp2);
+        if (raw_thresh < thresh) {
+            eval_glm_state(new_beta, false, next_ll);
+            if (std::isfinite(next_ll) && next_ll >= cur_ll - 1e-10 * (1.0 + std::abs(cur_ll))) {
+                est_beta = new_beta;
+                bConverge = true;
+                break;
+            }
+        }
 
-       new_beta = est_beta + comp1_2;
-       double cur_thresh = ((est_beta - new_beta).array().abs() / (est_beta + new_beta).array().abs()).maxCoeff();
-       est_beta = new_beta;
-       if(cur_thresh < thresh){
-           bConverge = true;
-           break;
-       }
-       curIter++;
+        // Evaluate next state with Armijo monotonicity safeguard against rare-trait / separation overshoot
+        bool accepted = false;
+        for (int bt = 0; bt < 12; ++bt) {
+            new_beta = est_beta + alpha * step;
+            eval_glm_state(new_beta, true, next_ll);
+            if (std::isfinite(next_ll) && next_ll >= cur_ll - 1e-10 * (1.0 + std::abs(cur_ll))) {
+                accepted = true;
+                break;
+            }
+            alpha *= 0.5;
+        }
+        if (!accepted) {
+            break;
+        }
+
+        double cur_thresh = ((est_beta - new_beta).array().abs() /
+                             (est_beta.array().abs() + new_beta.array().abs() + 1e-12)).maxCoeff();
+        est_beta = new_beta;
+        cur_ll = next_ll;
+        if(cur_thresh < thresh){
+            bConverge = true;
+            break;
+        }
+        curIter++;
     }
     return bConverge;
 }
 
 double varVector(const Ref<VectorXd> vec){
-    VectorXd vec_mean = vec.array() - vec.mean();
-    return(vec_mean.dot(vec_mean) / (vec.size() - 1));
+    const Eigen::Index n = vec.size();
+    if (n <= 1) return 0.0;
+    const double mean = vec.mean();
+    return (vec.array() - mean).matrix().squaredNorm() / static_cast<double>(n - 1);
 }
 
 bool checkNAN(const MatrixXd &mat){
