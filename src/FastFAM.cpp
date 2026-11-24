@@ -44,6 +44,7 @@
 #include <iomanip>
 #include "Covar.h"
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <chrono>
 
@@ -78,6 +79,7 @@ struct FastFAM::BinSparseLDLT {
         MatrixXd G;
         MatrixXd XtVX;
         MatrixXd solve_buf;
+        bool is_diag_only = false;
 
         void init(int32_t n_s, int32_t n_r, int32_t nnz_L, int32_t n_cols_aug = 0) {
             diag_s.assign(n_s, 0.0);
@@ -103,6 +105,9 @@ struct FastFAM::BinSparseLDLT {
 
     vector<int32_t> s_orig;
     vector<double> k_diag_s;
+    double min_k_diag_s = 0.0;
+    double max_k_diag_s = 0.0;
+    double min_w_s = 0.0;
     vector<int32_t> r_perm_orig;
 
     // Pre-gathered design + working response [X, Y] in row-major layout for singletons and permuted relateds
@@ -169,6 +174,16 @@ struct FastFAM::BinSparseLDLT {
         }
         n_s = static_cast<int32_t>(s_orig.size());
         n = static_cast<int32_t>(r_orig.size());
+        if (n_s > 0) {
+            auto mm = std::minmax_element(k_diag_s.begin(), k_diag_s.end());
+            min_k_diag_s = *mm.first;
+            max_k_diag_s = *mm.second;
+        }
+        if (n_s > 0) {
+            auto mm = std::minmax_element(k_diag_s.begin(), k_diag_s.end());
+            min_k_diag_s = *mm.first;
+            max_k_diag_s = *mm.second;
+        }
 
         if (n == 0) {
             nnz_L = 0;
@@ -355,11 +370,15 @@ struct FastFAM::BinSparseLDLT {
 
         v_s.resize(n_s);
         const int32_t * __restrict so = s_orig.data();
+        double cur_min_w = std::numeric_limits<double>::infinity();
         for (int32_t s = 0; s < n_s; ++s) {
             const int32_t idx = so[s];
-            v_s[s] = w_src[idx];
+            const double wv = w_src[idx];
+            v_s[s] = wv;
+            if (wv < cur_min_w) cur_min_w = wv;
             B_s(s, c) = y_src[idx];
         }
+        min_w_s = (n_s > 0) ? cur_min_w : 0.0;
 
         v_r_perm.resize(n);
         const int32_t * __restrict rpo = r_perm_orig.data();
@@ -386,22 +405,77 @@ struct FastFAM::BinSparseLDLT {
 
     double evalLogL(const double * __restrict w_s, const double * __restrict w_r_perm,
                     double cur_tao, Workspace &ws) const {
-        double logdet_V = 0.0;
-        if (!factorize(w_s, w_r_perm, cur_tao, ws, logdet_V)) {
-            return -std::numeric_limits<double>::infinity();
-        }
-
+        ws.is_diag_only = (cur_tao == 0.0);
         const int32_t c = n_covar;
         const int32_t m = c + 1;
-        ws.G.setZero(m, m);
 
-        if (n_s > 0) {
-            accumulateWeightedGram(B_s, ws.inv_diag_s.data(), n_s, m, ws.scaled_tile, ws.G);
+        // 1. Factorize the smaller related submatrix first so any non-PD grid point exits
+        // immediately before touching singletons.
+        double logdet_r = 0.0;
+        if (n > 0) {
+            if (!factorizeRelatedOnly(w_r_perm, cur_tao, ws, logdet_r)) {
+                return -std::numeric_limits<double>::infinity();
+            }
         }
 
+        ws.G.setZero(m, m);
+
+        // 2. Single-pass L1-tiled singleton evaluation: fuse d = w_s + tao * k_s,
+        // vectorized log(d), and weighted Gram accumulation without L2/DRAM round-trips.
+        double logdet_s = 0.0;
+        if (n_s > 0) {
+            const double * __restrict kd_s = k_diag_s.data();
+            double d_tile[kGramTileRows];
+            const bool guaranteed_pos = (ws.is_diag_only && min_w_s > 0.0) ||
+                (cur_tao > 0.0 && min_w_s + cur_tao * min_k_diag_s > 0.0) ||
+                (cur_tao < 0.0 && min_w_s + cur_tao * max_k_diag_s > 0.0);
+
+            for (int32_t r0 = 0; r0 < n_s; r0 += kGramTileRows) {
+                const int32_t rows = std::min<int32_t>(kGramTileRows, n_s - r0);
+                auto B_blk = B_s.middleRows(r0, rows);
+                auto S_blk = ws.scaled_tile.topRows(rows);
+
+                if (ws.is_diag_only) {
+                    if (!guaranteed_pos) {
+                        for (int32_t r = 0; r < rows; ++r) {
+                            const double d = w_s[r0 + r];
+                            if (!(d > 0.0)) return -std::numeric_limits<double>::infinity();
+                            d_tile[r] = d;
+                        }
+                    } else {
+                        std::memcpy(d_tile, w_s + r0, static_cast<size_t>(rows) * sizeof(double));
+                    }
+                } else if (guaranteed_pos) {
+                    for (int32_t r = 0; r < rows; ++r) {
+                        d_tile[r] = w_s[r0 + r] + cur_tao * kd_s[r0 + r];
+                    }
+                } else {
+                    for (int32_t r = 0; r < rows; ++r) {
+                        const double d = w_s[r0 + r] + cur_tao * kd_s[r0 + r];
+                        if (!(d > 0.0)) return -std::numeric_limits<double>::infinity();
+                        d_tile[r] = d;
+                    }
+                }
+
+                Map<const Eigen::ArrayXd> d_arr(d_tile, rows);
+                logdet_s += d_arr.log().sum();
+                for (int32_t r = 0; r < rows; ++r) {
+                    const double inv_d = 1.0 / d_tile[r];
+                    S_blk.row(r) = inv_d * B_blk.row(r);
+                }
+                ws.G.noalias() += B_blk.transpose() * S_blk;
+            }
+            if (!std::isfinite(logdet_s)) {
+                return -std::numeric_limits<double>::infinity();
+            }
+        }
+
+        // 3. Forward half-solve and Gram accumulation on the related submatrix
         if (n > 0) {
-            ws.U_r = B_r_perm;
-            if (nnz_L > 0) {
+            if (ws.is_diag_only || nnz_L == 0) {
+                accumulateWeightedGram(B_r_perm, ws.inv_diag.data(), n, m, ws.scaled_tile, ws.G);
+            } else {
+                ws.U_r = B_r_perm;
                 const int32_t * __restrict lp = Lp.data();
                 const int32_t * __restrict li = Li.data();
                 const double * __restrict Lx = ws.Lx.data();
@@ -419,8 +493,8 @@ struct FastFAM::BinSparseLDLT {
                         }
                     }
                 }
+                accumulateWeightedGram(ws.U_r, ws.inv_diag.data(), n, m, ws.scaled_tile, ws.G);
             }
-            accumulateWeightedGram(ws.U_r, ws.inv_diag.data(), n, m, ws.scaled_tile, ws.G);
         }
 
         ws.XtVX = ws.G.topLeftCorner(c, c);
@@ -433,7 +507,7 @@ struct FastFAM::BinSparseLDLT {
         const VectorXd beta_hat = XtVX_solver.solve(XtVY);
         const double yPy = ws.G(c, c) - XtVY.dot(beta_hat);
 
-        return -0.5 * (logdet_V + logdet_XtVX + yPy);
+        return -0.5 * (logdet_s + logdet_r + logdet_XtVX + yPy);
     }
 
     void permuteWeights(const Ref<const VectorXd> &v_orig, vector<double> &v_s, vector<double> &v_r_perm) const {
@@ -450,36 +524,24 @@ struct FastFAM::BinSparseLDLT {
         }
     }
 
-    bool factorize(const double * __restrict w_s, const double * __restrict w_r_perm, double cur_tao, Workspace &ws, double &out_logdet) const {
-        if (n_total == 0) {
-            out_logdet = 0.0;
+    bool factorizeRelatedOnly(const double * __restrict w_r_perm, double cur_tao, Workspace &ws, double &out_logdet_r) const {
+        if (n == 0) {
+            out_logdet_r = 0.0;
             return true;
         }
-        double logdet_s = 0.0;
-        if (n_s > 0) {
-            double * __restrict d_s = ws.diag_s.data();
-            double * __restrict inv_d_s = ws.inv_diag_s.data();
-            const double * __restrict kd_s = k_diag_s.data();
-            for (int32_t s = 0; s < n_s; ++s) {
-                const double d = w_s[s] + cur_tao * kd_s[s];
+        double * __restrict diag = ws.diag.data();
+        double * __restrict inv_diag = ws.inv_diag.data();
+        if (ws.is_diag_only) {
+            for (int32_t k = 0; k < n; ++k) {
+                const double d = w_r_perm[k];
                 if (!(d > 0.0)) {
                     return false;
                 }
-                d_s[s] = d;
-                inv_d_s[s] = 1.0 / d;
+                diag[k] = d;
+                inv_diag[k] = 1.0 / d;
             }
-            Map<const VectorXd> ds_vec(d_s, n_s);
-            logdet_s = ds_vec.array().log().sum();
-            if (!std::isfinite(logdet_s)) {
-                return false;
-            }
-        }
-
-        double logdet_r = 0.0;
-        if (n > 0) {
+        } else {
             double * __restrict Lx = ws.Lx.data();
-            double * __restrict diag = ws.diag.data();
-            double * __restrict inv_diag = ws.inv_diag.data();
             double * __restrict y = ws.y.data();
             const int32_t * __restrict lp = Lp.data();
             const int32_t * __restrict li = Li.data();
@@ -515,10 +577,50 @@ struct FastFAM::BinSparseLDLT {
                 diag[k] = d;
                 inv_diag[k] = 1.0 / d;
             }
+        }
 
-            Map<const VectorXd> dr_vec(diag, n);
-            logdet_r = dr_vec.array().log().sum();
-            if (!std::isfinite(logdet_r)) {
+        Map<const VectorXd> dr_vec(diag, n);
+        out_logdet_r = dr_vec.array().log().sum();
+        return std::isfinite(out_logdet_r);
+    }
+
+    bool factorize(const double * __restrict w_s, const double * __restrict w_r_perm, double cur_tao, Workspace &ws, double &out_logdet) const {
+        ws.is_diag_only = (cur_tao == 0.0);
+        if (n_total == 0) {
+            out_logdet = 0.0;
+            return true;
+        }
+        double logdet_r = 0.0;
+        if (!factorizeRelatedOnly(w_r_perm, cur_tao, ws, logdet_r)) {
+            return false;
+        }
+        double logdet_s = 0.0;
+        if (n_s > 0) {
+            double * __restrict d_s = ws.diag_s.data();
+            double * __restrict inv_d_s = ws.inv_diag_s.data();
+            const double * __restrict kd_s = k_diag_s.data();
+            if (ws.is_diag_only) {
+                for (int32_t s = 0; s < n_s; ++s) {
+                    const double d = w_s[s];
+                    if (!(d > 0.0)) {
+                        return false;
+                    }
+                    d_s[s] = d;
+                    inv_d_s[s] = 1.0 / d;
+                }
+            } else {
+                for (int32_t s = 0; s < n_s; ++s) {
+                    const double d = w_s[s] + cur_tao * kd_s[s];
+                    if (!(d > 0.0)) {
+                        return false;
+                    }
+                    d_s[s] = d;
+                    inv_d_s[s] = 1.0 / d;
+                }
+            }
+            Map<const VectorXd> ds_vec(d_s, n_s);
+            logdet_s = ds_vec.array().log().sum();
+            if (!std::isfinite(logdet_s)) {
                 return false;
             }
         }
@@ -553,10 +655,15 @@ struct FastFAM::BinSparseLDLT {
             }
 
             if (n > 0) {
-                for (int32_t k = 0; k < n; ++k) {
-                    dst[k] = src[rpo[k]];
-                }
-                if (nnz_L > 0) {
+                if (ws.is_diag_only || nnz_L == 0) {
+                    for (int32_t k = 0; k < n; ++k) {
+                        const int32_t idx = rpo[k];
+                        out_col[idx] = src[idx] * inv_diag[k];
+                    }
+                } else {
+                    for (int32_t k = 0; k < n; ++k) {
+                        dst[k] = src[rpo[k]];
+                    }
                     for (int32_t i = 0; i < n; ++i) {
                         const double tmp = dst[i];
                         if (tmp != 0.0) {
@@ -565,11 +672,9 @@ struct FastFAM::BinSparseLDLT {
                             }
                         }
                     }
-                }
-                for (int32_t i = 0; i < n; ++i) {
-                    dst[i] *= inv_diag[i];
-                }
-                if (nnz_L > 0) {
+                    for (int32_t i = 0; i < n; ++i) {
+                        dst[i] *= inv_diag[i];
+                    }
                     for (int32_t i = n - 1; i >= 0; --i) {
                         double tmp = dst[i];
                         for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
@@ -577,9 +682,9 @@ struct FastFAM::BinSparseLDLT {
                         }
                         dst[i] = tmp;
                     }
-                }
-                for (int32_t k = 0; k < n; ++k) {
-                    out_col[rpo[k]] = dst[k];
+                    for (int32_t k = 0; k < n; ++k) {
+                        out_col[rpo[k]] = dst[k];
+                    }
                 }
             }
         }
@@ -599,18 +704,23 @@ struct FastFAM::BinSparseLDLT {
         }
 
         if (n > 0) {
-            ws.solve_buf.resize(n, 1);
-            double * __restrict dst = ws.solve_buf.data();
             const int32_t * __restrict rpo = r_perm_orig.data();
-            const int32_t * __restrict lp = Lp.data();
-            const int32_t * __restrict li = Li.data();
-            const double * __restrict Lx = ws.Lx.data();
             const double * __restrict inv_diag = ws.inv_diag.data();
+            if (ws.is_diag_only || nnz_L == 0) {
+                for (int32_t k = 0; k < n; ++k) {
+                    const int32_t idx = rpo[k];
+                    out_ptr[idx] = src[idx] * inv_diag[k];
+                }
+            } else {
+                ws.solve_buf.resize(n, 1);
+                double * __restrict dst = ws.solve_buf.data();
+                const int32_t * __restrict lp = Lp.data();
+                const int32_t * __restrict li = Li.data();
+                const double * __restrict Lx = ws.Lx.data();
 
-            for (int32_t k = 0; k < n; ++k) {
-                dst[k] = src[rpo[k]];
-            }
-            if (nnz_L > 0) {
+                for (int32_t k = 0; k < n; ++k) {
+                    dst[k] = src[rpo[k]];
+                }
                 for (int32_t i = 0; i < n; ++i) {
                     const double tmp = dst[i];
                     if (tmp != 0.0) {
@@ -619,11 +729,9 @@ struct FastFAM::BinSparseLDLT {
                         }
                     }
                 }
-            }
-            for (int32_t i = 0; i < n; ++i) {
-                dst[i] *= inv_diag[i];
-            }
-            if (nnz_L > 0) {
+                for (int32_t i = 0; i < n; ++i) {
+                    dst[i] *= inv_diag[i];
+                }
                 for (int32_t i = n - 1; i >= 0; --i) {
                     double tmp = dst[i];
                     for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
@@ -631,9 +739,9 @@ struct FastFAM::BinSparseLDLT {
                     }
                     dst[i] = tmp;
                 }
-            }
-            for (int32_t k = 0; k < n; ++k) {
-                out_ptr[rpo[k]] = dst[k];
+                for (int32_t k = 0; k < n; ++k) {
+                    out_ptr[rpo[k]] = dst[k];
+                }
             }
         }
     }
@@ -652,18 +760,23 @@ struct FastFAM::BinSparseLDLT {
         }
 
         if (n > 0) {
-            tmp_buf.resize(n);
-            double * __restrict dst = tmp_buf.data();
             const int32_t * __restrict rpo = r_perm_orig.data();
-            const int32_t * __restrict lp = Lp.data();
-            const int32_t * __restrict li = Li.data();
-            const double * __restrict Lx = main_ws.Lx.data();
             const double * __restrict inv_diag = main_ws.inv_diag.data();
+            if (main_ws.is_diag_only || nnz_L == 0) {
+                for (int32_t k = 0; k < n; ++k) {
+                    const int32_t idx = rpo[k];
+                    out_ptr[idx] = src[idx] * inv_diag[k];
+                }
+            } else {
+                tmp_buf.resize(n);
+                double * __restrict dst = tmp_buf.data();
+                const int32_t * __restrict lp = Lp.data();
+                const int32_t * __restrict li = Li.data();
+                const double * __restrict Lx = main_ws.Lx.data();
 
-            for (int32_t k = 0; k < n; ++k) {
-                dst[k] = src[rpo[k]];
-            }
-            if (nnz_L > 0) {
+                for (int32_t k = 0; k < n; ++k) {
+                    dst[k] = src[rpo[k]];
+                }
                 for (int32_t i = 0; i < n; ++i) {
                     const double tmp = dst[i];
                     if (tmp != 0.0) {
@@ -672,11 +785,9 @@ struct FastFAM::BinSparseLDLT {
                         }
                     }
                 }
-            }
-            for (int32_t i = 0; i < n; ++i) {
-                dst[i] *= inv_diag[i];
-            }
-            if (nnz_L > 0) {
+                for (int32_t i = 0; i < n; ++i) {
+                    dst[i] *= inv_diag[i];
+                }
                 for (int32_t i = n - 1; i >= 0; --i) {
                     double tmp = dst[i];
                     for (int32_t p = lp[i]; p < lp[i + 1]; ++p) {
@@ -684,9 +795,9 @@ struct FastFAM::BinSparseLDLT {
                     }
                     dst[i] = tmp;
                 }
-            }
-            for (int32_t k = 0; k < n; ++k) {
-                out_ptr[rpo[k]] = dst[k];
+                for (int32_t k = 0; k < n; ++k) {
+                    out_ptr[rpo[k]] = dst[k];
+                }
             }
         }
     }
@@ -4427,30 +4538,48 @@ bool FastFAM::covarGLM(const VectorXd& phenoVec, const MatrixXd& covar, Ref<Vect
     bool bConverge = false;
     int curIter = 0;
 
-    while(curIter < maxIter){
-       VectorXd theta = covar * est_beta;
-       VectorXd theta_exp = theta.array().exp();
-        
-       VectorXd mu = theta_exp.array() / (theta_exp.array() + 1);
-       VectorXd diags = mu.array() * (-mu.array() + 1);
+    const Eigen::Index n_rows = covar.rows();
+    const Eigen::Index n_cols = covar.cols();
+    VectorXd theta(n_rows);
+    VectorXd mu(n_rows);
+    VectorXd diags(n_rows);
+    VectorXd resi(n_rows);
+    MatrixXd XtWX(n_cols, n_cols);
+    VectorXd comp2(n_cols);
+    VectorXd new_beta(n_cols);
+    const Eigen::Index kTile = 512;
+    MatrixXd scaled_tile(std::min<Eigen::Index>(kTile, n_rows), n_cols);
 
-        // covar.transpose().array().colwise() * diags.array()
-       MatrixXd XtWX =  covar.transpose() * diags.asDiagonal() * covar;
-       VectorXd comp2 = covar.transpose() * (phenoVec - mu);
+    while(curIter < maxIter){
+       theta.noalias() = covar * est_beta;
+       mu = 1.0 / ((-theta.array()).exp() + 1.0);
+       diags = mu.array() * (-mu.array() + 1.0);
+       resi = phenoVec - mu;
+
+       XtWX.setZero();
+       for(Eigen::Index r0 = 0; r0 < n_rows; r0 += kTile){
+           const Eigen::Index rows = std::min<Eigen::Index>(kTile, n_rows - r0);
+           auto X_blk = covar.middleRows(r0, rows);
+           auto S_blk = scaled_tile.topRows(rows);
+           S_blk = X_blk.array().colwise() * diags.segment(r0, rows).array();
+           XtWX.noalias() += X_blk.transpose() * S_blk;
+       }
+       comp2.noalias() = covar.transpose() * resi;
+
        auto XtWX_solver = XtWX.colPivHouseholderQr();
        if(!XtWX_solver.isInvertible()){
            LOGGER.e(0, "XtWX is not invertible.");
        }
        VectorXd comp1_2 = XtWX_solver.solve(comp2);
 
-       VectorXd new_beta = est_beta + comp1_2;
-       VectorXd mChange = (est_beta - new_beta).array().abs() / (est_beta + new_beta).array().abs();
-       double cur_thresh = mChange.maxCoeff();
+       new_beta = est_beta + comp1_2;
+       double cur_thresh = ((est_beta - new_beta).array().abs() / (est_beta + new_beta).array().abs()).maxCoeff();
        est_beta = new_beta;
        if(cur_thresh < thresh){
            bConverge = true;
            break;
        }
+       curIter++;
     }
     return bConverge;
 }
@@ -4671,54 +4800,83 @@ bool FastFAM::binGridREML(const SpMat& fam, Ref<VectorXd> est_a, int maxIter, do
         
         double start = startTao;
         double end = endTao;
+        vector<std::pair<double, double>> eval_cache;
+        eval_cache.reserve(1024);
 
        for(int iter = 0; iter < trails.size(); iter++){
             int n_trails = trails[iter];
             double step = (end - start) / (n_trails - 1);
             vector<double> varcomps(n_trails);
             vector<double> logLs(n_trails);
+            vector<int> todo_indices;
+            todo_indices.reserve(n_trails);
 
-#if defined(OPENBLAS_CONST)
-            int prev_blas_threads = openblas_get_num_threads();
-            openblas_set_num_threads(1);
-#endif
-            #pragma omp parallel
-            {
-                #pragma omp single
-                {
-#ifdef _OPENMP
-                    int active_threads = omp_get_num_threads();
-                    if (active_threads > static_cast<int>(thread_ws.size())) {
-                        int old_sz = static_cast<int>(thread_ws.size());
-                        thread_ws.resize(active_threads);
-                        for (int t = old_sz; t < active_threads; ++t) {
-                            thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
-                        }
+            for(int i = 0; i < n_trails; i++){
+                double temp_tao = start + i * step;
+                varcomps[i] = temp_tao;
+                if(!eval_cache.empty()){
+                    auto it_cache = std::lower_bound(
+                        eval_cache.begin(), eval_cache.end(), temp_tao,
+                        [](const std::pair<double, double> &a, double val){ return a.first < val; });
+                    if(it_cache != eval_cache.end() && it_cache->first == temp_tao){
+                        logLs[i] = it_cache->second;
+                        continue;
                     }
-#endif
                 }
-#if GCTA_CPU_x86
-                mkl_set_num_threads_local(1);
-#endif
-                int tid = 0;
-#ifdef _OPENMP
-                tid = omp_get_thread_num();
-#endif
-                BinSparseLDLT::Workspace &ws = thread_ws[tid];
-
-                #pragma omp for schedule(dynamic)
-                for(int i = 0; i < n_trails; i++){
-                    double temp_tao = start + i * step;
-                    varcomps[i] = temp_tao;
-                    logLs[i] = binSolverV->evalLogL(w_s.data(), w_r_perm.data(), temp_tao, ws);
-                }
-#if GCTA_CPU_x86
-                mkl_set_num_threads_local(0);
-#endif
+                todo_indices.push_back(i);
             }
+
+            const int n_todo = static_cast<int>(todo_indices.size());
+            if(n_todo > 0){
 #if defined(OPENBLAS_CONST)
-            openblas_set_num_threads(prev_blas_threads);
+                int prev_blas_threads = openblas_get_num_threads();
+                openblas_set_num_threads(1);
 #endif
+                #pragma omp parallel
+                {
+                    #pragma omp single
+                    {
+#ifdef _OPENMP
+                        int active_threads = omp_get_num_threads();
+                        if (active_threads > static_cast<int>(thread_ws.size())) {
+                            int old_sz = static_cast<int>(thread_ws.size());
+                            thread_ws.resize(active_threads);
+                            for (int t = old_sz; t < active_threads; ++t) {
+                                thread_ws[t].init(binSolverV->n_s, binSolverV->n, binSolverV->nnz_L, n_cols_aug);
+                            }
+                        }
+#endif
+                    }
+#if GCTA_CPU_x86
+                    mkl_set_num_threads_local(1);
+#endif
+                    int tid = 0;
+#ifdef _OPENMP
+                    tid = omp_get_thread_num();
+#endif
+                    BinSparseLDLT::Workspace &ws = thread_ws[tid];
+
+                    #pragma omp for schedule(dynamic)
+                    for(int k = 0; k < n_todo; k++){
+                        int i = todo_indices[k];
+                        logLs[i] = binSolverV->evalLogL(w_s.data(), w_r_perm.data(), varcomps[i], ws);
+                    }
+#if GCTA_CPU_x86
+                    mkl_set_num_threads_local(0);
+#endif
+                }
+#if defined(OPENBLAS_CONST)
+                openblas_set_num_threads(prev_blas_threads);
+#endif
+                for(int k = 0; k < n_todo; k++){
+                    int i = todo_indices[k];
+                    eval_cache.push_back(std::make_pair(varcomps[i], logLs[i]));
+                }
+                std::sort(eval_cache.begin(), eval_cache.end(),
+                          [](const std::pair<double, double> &a, const std::pair<double, double> &b){
+                              return a.first < b.first;
+                          });
+            }
 
             double max_logL = -1e300;
             double max_varcomp = 0;
