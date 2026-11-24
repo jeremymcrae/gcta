@@ -44,6 +44,7 @@
 #include <iomanip>
 #include "Covar.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <chrono>
@@ -2929,89 +2930,137 @@ double FastFAM::HEreg(vector<double> &Zij, vector<double> &Aij, bool &isSig, dou
 
 void FastFAM::readFAM(string filename, SpMat& fam, const vector<string> &ids, vector<uint32_t> &remain_index){
     LOGGER.i(0, "Reading the sparse GRM file from [" + filename + "]...");
-    uint32_t num_indi = ids.size();
     vector<string> sublist = Pheno::read_sublist(filename + ".grm.id");
     vector<uint32_t> fam_index;
     vector_commonIndex(sublist, ids, fam_index, remain_index);
-    //LOGGER.i(0, "DEBUG: " + to_string(fam_index.size()) + " subjects remained");
 
-    //Fix index order to outside, that fix the phenotype, covar order
+    // Fix index order to outside, preserving phenotype and covariate sample order
     vector<size_t> index_list_order = sort_indexes(remain_index);
-    vector<uint32_t> ordered_fam_index(remain_index.size(), 0);
-    vector<uint32_t> ordered_remain_index(remain_index.size(), 0);
+    const size_t n_keep = remain_index.size();
+    vector<uint32_t> ordered_fam_index(n_keep, 0);
+    vector<uint32_t> ordered_remain_index(n_keep, 0);
     std::transform(index_list_order.begin(), index_list_order.end(), ordered_fam_index.begin(), [&fam_index](size_t pos){
             return fam_index[pos];});
     std::transform(index_list_order.begin(), index_list_order.end(), ordered_remain_index.begin(), [&remain_index](size_t pos){
             return remain_index[pos];});
     remain_index = ordered_remain_index;
 
-    std::ifstream pair_list((filename + ".grm.sp").c_str());
-    if(!pair_list){
-        LOGGER.e(0, "can't read [" + filename + ".grm.sp]");
+    string sp_path = filename + ".grm.sp";
+    FILE *fp = std::fopen(sp_path.c_str(), "rb");
+    if(!fp){
+        LOGGER.e(0, "can't read [" + sp_path + "]");
     }
+    vector<char> io_buf(1 << 20);
+    std::setvbuf(fp, io_buf.data(), _IOFBF, io_buf.size());
 
-    string line;
-    int line_number = 0;
-    int last_length = 0;
+    uint32_t max_fam_id = static_cast<uint32_t>(sublist.size());
+    for(size_t idx = 0; idx < n_keep; ++idx){
+        if(ordered_fam_index[idx] >= max_fam_id){
+            max_fam_id = ordered_fam_index[idx] + 1;
+        }
+    }
+    vector<int32_t> map_index(max_fam_id, -1);
+    for(size_t idx = 0; idx < n_keep; ++idx){
+        map_index[ordered_fam_index[idx]] = static_cast<int32_t>(idx);
+    }
 
     vector<uint32_t> id1;
     vector<uint32_t> id2;
     vector<double> grm;
+    id1.reserve(n_keep * 2);
+    id2.reserve(n_keep * 2);
+    grm.reserve(n_keep * 2);
 
-    vector<uint32_t> num_elements(remain_index.size(), 0);
+    vector<int64_t> num_elements(n_keep, 0);
 
-    map<uint32_t, uint32_t> map_index;
-    for(uint32_t index = 0; index != ordered_fam_index.size(); index++){
-        map_index[ordered_fam_index[index]] = index;
-    }
+    char line_buf[4096];
+    while(std::fgets(line_buf, sizeof(line_buf), fp)){
+        const char *p = line_buf;
+        while(*p == ' ' || *p == '\t') ++p;
+        if(*p == '\0' || *p == '\n' || *p == '\r') continue;
 
+        char *endp = NULL;
+        unsigned long raw_id1 = std::strtoul(p, &endp, 10);
+        if(endp == p) continue;
+        p = endp;
 
-    while(std::getline(pair_list, line)){
-        line_number++;
-        std::istringstream line_buf(line);
-        std::istream_iterator<string> begin(line_buf), end;
-        vector<string> line_elements(begin, end);
+        unsigned long raw_id2 = std::strtoul(p, &endp, 10);
+        if(endp == p) continue;
+        p = endp;
 
-        uint32_t tmp_id1 = (std::stoi(line_elements[0]));
-        uint32_t tmp_id2 = (std::stoi(line_elements[1]));
-        if(map_index.find(tmp_id1) != map_index.end() &&
-                map_index.find(tmp_id2) != map_index.end()){
-            tmp_id1 = map_index[tmp_id1];
-            tmp_id2 = map_index[tmp_id2];
-
-            double tmp_grm = std::stod(line_elements[2]);
-            id1.push_back(tmp_id1);
-            id2.push_back(tmp_id2);
-            num_elements[tmp_id2] += 1;
-            grm.push_back(tmp_grm);
-            if(tmp_id1 != tmp_id2){
-                id1.push_back(tmp_id2);
-                id2.push_back(tmp_id1);
-                num_elements[tmp_id1] += 1;
+        if(raw_id1 < max_fam_id && raw_id2 < max_fam_id){
+            int32_t mapped1 = map_index[raw_id1];
+            int32_t mapped2 = map_index[raw_id2];
+            if(mapped1 >= 0 && mapped2 >= 0){
+                double tmp_grm = std::strtod(p, &endp);
+                uint32_t u1 = static_cast<uint32_t>(mapped1);
+                uint32_t u2 = static_cast<uint32_t>(mapped2);
+                id1.push_back(u1);
+                id2.push_back(u2);
+                num_elements[u2] += 1;
                 grm.push_back(tmp_grm);
+                if(u1 != u2){
+                    id1.push_back(u2);
+                    id2.push_back(u1);
+                    num_elements[u1] += 1;
+                    grm.push_back(tmp_grm);
+                }
             }
         }
     }
-    pair_list.close();
-    /*
-    std::ofstream out("test.txt");
-    for(int i = 0; i < id1.size(); i++){
-        out << id1[i] << "\t" <<  id2[i] << "\t" << grm[i] << std::endl;
+    std::fclose(fp);
+
+    // Direct compressed column-major assembly via counting bucket placement + per-column sort
+    fam.resize(n_keep, n_keep);
+    const int64_t total_nnz = static_cast<int64_t>(id1.size());
+    fam.resizeNonZeros(total_nnz);
+
+    long long *outer_ptr = fam.outerIndexPtr();
+    long long *inner_ptr = fam.innerIndexPtr();
+    double *val_ptr = fam.valuePtr();
+
+    vector<int64_t> write_pos(n_keep, 0);
+    int64_t offset = 0;
+    for(size_t col = 0; col < n_keep; ++col){
+        outer_ptr[col] = offset;
+        write_pos[col] = offset;
+        offset += num_elements[col];
     }
-    out.close();
-    */
+    outer_ptr[n_keep] = offset;
 
-    auto sorted_index = sort_indexes(id2, id1);
-
-    fam.resize(ordered_fam_index.size(), ordered_fam_index.size());
-    fam.reserve(num_elements);
-
-    for(auto index : sorted_index){
-        fam.insertBackUncompressed(id1[index], id2[index]) = grm[index];
+    for(int64_t k = 0; k < total_nnz; ++k){
+        uint32_t col = id2[k];
+        int64_t pos = write_pos[col]++;
+        inner_ptr[pos] = static_cast<long long>(id1[k]);
+        val_ptr[pos] = grm[k];
     }
-    fam.finalize();
-    fam.makeCompressed();
 
+    vector<std::pair<long long, double>> col_entries;
+    for(size_t col = 0; col < n_keep; ++col){
+        int64_t c_start = outer_ptr[col];
+        int64_t c_end = outer_ptr[col + 1];
+        int64_t len = c_end - c_start;
+        if(len <= 1) continue;
+        if(len == 2){
+            if(inner_ptr[c_start] > inner_ptr[c_start + 1]){
+                std::swap(inner_ptr[c_start], inner_ptr[c_start + 1]);
+                std::swap(val_ptr[c_start], val_ptr[c_start + 1]);
+            }
+            continue;
+        }
+        col_entries.resize(len);
+        for(int64_t r = 0; r < len; ++r){
+            col_entries[r] = std::make_pair(inner_ptr[c_start + r], val_ptr[c_start + r]);
+        }
+        std::stable_sort(col_entries.begin(), col_entries.end(),
+                         [](const std::pair<long long, double> &a, const std::pair<long long, double> &b){
+                             return a.first < b.first;
+                         });
+        for(int64_t r = 0; r < len; ++r){
+            inner_ptr[c_start + r] = col_entries[r].first;
+            val_ptr[c_start + r] = col_entries[r].second;
+        }
+    }
 }
 
 void FastFAM::grammar_func(uintptr_t *genobuf, const vector<uint32_t> &markerIndex){
