@@ -2058,74 +2058,151 @@ void printVector(const vector<double> &v, string label){
     LOGGER << std::endl;
 }
 
+struct SPAWorkspace {
+    vector<double> gNZ;
+    vector<double> muNZ;
+    vector<double> oneMinusMuNZ;
+    vector<double> muGNZ;
+    vector<double> mu1muNZG;
+    vector<double> muGFull;
+    vector<double> mu1muGFull;
+};
+
 class SPA{
 private:
     double q, qinv;
     double gPos, gNeg;
-    static ArrayXd mu;
+    static VectorXd mu;
+    static VectorXd oneMinusMu;
+    static VectorXd dWpVec;
     static int nSample;
-    ArrayXd mu1muG;
-    ArrayXd geno;
+    const double *genoPtr;
+    SPAWorkspace *ws;
+    int nNZ;
     bool bFast;
-    ArrayXd muNZ;
-    ArrayXd mu1muNZG;
-    ArrayXd gNZ;
     double NAmu;
     double NAsigma;
+    double totMuG;
+    double totMu1MuG;
 
-    double K1adj(double t1, double q){
-        //ArrayXd temp1 = mu1 * (-geno * t1).exp() + mu;
-        //ArrayXd temp2 = mu * geno;
+    double K1adj(double t1, double q_val) const {
         if(bFast){
-            double temp2dtemp1 = ((muNZ * gNZ)/((1.0 - muNZ) * (-gNZ * t1).exp() + muNZ)).sum();
-            return temp2dtemp1 + NAmu + NAsigma * t1 - q;
+            const double * __restrict g = ws->gNZ.data();
+            const double * __restrict m = ws->muNZ.data();
+            const double * __restrict m1 = ws->oneMinusMuNZ.data();
+            const double * __restrict mg = ws->muGNZ.data();
+            double s = 0.0;
+            for(int i = 0; i < nNZ; ++i){
+                s += mg[i] / (m1[i] * std::exp(-g[i] * t1) + m[i]);
+            }
+            return s + NAmu + NAsigma * t1 - q_val;
         }else{
-            return ((mu * geno)/((1.0 - mu) * (-geno * t1).exp() + mu)).sum() - q;
+            const double * __restrict g = genoPtr;
+            const double * __restrict m = mu.data();
+            const double * __restrict m1 = oneMinusMu.data();
+            const double * __restrict mg = ws->muGFull.data();
+            double s = 0.0;
+            for(int i = 0; i < nSample; ++i){
+                s += mg[i] / (m1[i] * std::exp(-g[i] * t1) + m[i]);
+            }
+            return s - q_val;
         }
     }
 
-    double K2(double t1){
+    void evalK1K2(double t1, double q_val, double &out_k1, double &out_k2) const {
         if(bFast){
-            ArrayXd genot1exp = (-gNZ * t1).exp();
-            ArrayXd div21 = (mu1muNZG * genot1exp) / ((1.0 - muNZ) * genot1exp + muNZ).square();
-            return ((!div21.isNaN()).select(div21, 0)).sum() + NAsigma;
+            const double * __restrict g = ws->gNZ.data();
+            const double * __restrict m = ws->muNZ.data();
+            const double * __restrict m1 = ws->oneMinusMuNZ.data();
+            const double * __restrict mg = ws->muGNZ.data();
+            const double * __restrict m1mg2 = ws->mu1muNZG.data();
+            double sk1 = 0.0;
+            double sk2 = 0.0;
+            for(int i = 0; i < nNZ; ++i){
+                const double e = std::exp(-g[i] * t1);
+                const double denom = m1[i] * e + m[i];
+                const double inv_d = 1.0 / denom;
+                sk1 += mg[i] * inv_d;
+                const double d2 = (m1mg2[i] * e) * (inv_d * inv_d);
+                if(!std::isnan(d2)){
+                    sk2 += d2;
+                }
+            }
+            out_k1 = sk1 + NAmu + NAsigma * t1 - q_val;
+            out_k2 = sk2 + NAsigma;
         }else{
-            ArrayXd genot1exp = (-geno * t1).exp();
-            ArrayXd div21 = (mu1muG * genot1exp) / ((1.0 - mu) * genot1exp + mu).square();
-            return ((!div21.isNaN()).select(div21, 0)).sum();
+            const double * __restrict g = genoPtr;
+            const double * __restrict m = mu.data();
+            const double * __restrict m1 = oneMinusMu.data();
+            const double * __restrict mg = ws->muGFull.data();
+            const double * __restrict m1mg2 = ws->mu1muGFull.data();
+            double sk1 = 0.0;
+            double sk2 = 0.0;
+            for(int i = 0; i < nSample; ++i){
+                const double e = std::exp(-g[i] * t1);
+                const double denom = m1[i] * e + m[i];
+                const double inv_d = 1.0 / denom;
+                sk1 += mg[i] * inv_d;
+                const double d2 = (m1mg2[i] * e) * (inv_d * inv_d);
+                if(!std::isnan(d2)){
+                    sk2 += d2;
+                }
+            }
+            out_k1 = sk1 - q_val;
+            out_k2 = sk2;
         }
-    }
-
-    double Korg(double t1){
-        return (1.0 - mu + mu * (geno * t1).exp()).log().sum();
     }
 
     struct KS{ double k1; double k2;};
 
-    inline void KorgK2(double t1, KS *ks){
+    inline void KorgK2(double t1, KS *ks) const {
         if(bFast){
-            ArrayXd genot1exp = (-gNZ * t1).exp();
-            ArrayXd div21 = (mu1muNZG * genot1exp) / ((1.0 - muNZ) * genot1exp + muNZ).square();
-            ks->k2 = ((!div21.isNaN()).select(div21, 0)).sum() + NAsigma;
-            ks->k1 = (1.0 - muNZ + muNZ / genot1exp).log().sum() + NAmu * t1 + 0.5 * NAsigma * t1 * t1;
+            const double * __restrict g = ws->gNZ.data();
+            const double * __restrict m = ws->muNZ.data();
+            const double * __restrict m1 = ws->oneMinusMuNZ.data();
+            const double * __restrict m1mg2 = ws->mu1muNZG.data();
+            double sk1 = 0.0;
+            double sk2 = 0.0;
+            for(int i = 0; i < nNZ; ++i){
+                const double e = std::exp(-g[i] * t1);
+                const double denom = m1[i] * e + m[i];
+                const double d2 = (m1mg2[i] * e) / (denom * denom);
+                if(!std::isnan(d2)){
+                    sk2 += d2;
+                }
+                sk1 += std::log(m1[i] + m[i] / e);
+            }
+            ks->k2 = sk2 + NAsigma;
+            ks->k1 = sk1 + NAmu * t1 + 0.5 * NAsigma * t1 * t1;
         }else{
-            ArrayXd genot1exp = (-geno * t1).exp();
-            ArrayXd div21 = (mu1muG * genot1exp) / ((1.0 - mu) * genot1exp + mu).square();
-            ks->k2 = ((!div21.isNaN()).select(div21, 0)).sum();
-            ks->k1 = (1.0 - mu + mu / genot1exp).log().sum();
+            const double * __restrict g = genoPtr;
+            const double * __restrict m = mu.data();
+            const double * __restrict m1 = oneMinusMu.data();
+            const double * __restrict m1mg2 = ws->mu1muGFull.data();
+            double sk1 = 0.0;
+            double sk2 = 0.0;
+            for(int i = 0; i < nSample; ++i){
+                const double e = std::exp(-g[i] * t1);
+                const double denom = m1[i] * e + m[i];
+                const double d2 = (m1mg2[i] * e) / (denom * denom);
+                if(!std::isnan(d2)){
+                    sk2 += d2;
+                }
+                sk1 += std::log(m1[i] + m[i] / e);
+            }
+            ks->k2 = sk2;
+            ks->k1 = sk1;
         }
     }
 
-    double getSaddleProb(double zeta, double q){
+    double getSaddleProb(double zeta, double q_val) const {
         KS ks;
         KorgK2(zeta, &ks);
-        //double k1 = Korg(zeta);
-        //double k2 = K2(zeta);
         double k1 = ks.k1;
         double k2 = ks.k2;
         double pval = 0;
         if(std::isfinite(k1) && std::isfinite(k2)){
-            double temp1 = zeta * q - k1;
+            double temp1 = zeta * q_val - k1;
             double w = sgn(zeta) * std::sqrt(2.0) * std::sqrt(temp1);
             double wi = 1.0 / w;
             double v = zeta * std::sqrt(k2);
@@ -2139,20 +2216,26 @@ private:
         return(pval);
     }
 
-    K1Res getRootK1(double init, double q, double thresh=0.0001220703, int maxIter=1000){
+    K1Res getRootK1(double init, double q_val, double thresh=0.0001220703, int maxIter=1000) const {
         K1Res res;
-        if(q >= gPos || q <= gNeg){
+        if(q_val >= gPos || q_val <= gNeg){
             res.root = std::numeric_limits<double>::infinity();
             res.nIter = 0;
             res.bConverge = true;
             return(res);
         }else{
             double t1 = init;
-            double K1eval = K1adj(t1, q);
+            double K1eval = 0.0;
+            double K2eval = 0.0;
+            if(t1 == 0.0){
+                K1eval = (bFast ? ((qinv + q) * 0.5) : totMuG) - q_val;
+                K2eval = totMu1MuG;
+            }else{
+                evalK1K2(t1, q_val, K1eval, K2eval);
+            }
             double prevJump = std::numeric_limits<double>::infinity();
             int nIter = 1;
             while(true){
-                double K2eval = K2(t1);
                 double tnew = t1 - K1eval / K2eval;
                 if(!std::isfinite(tnew)){
                     res.bConverge = false;
@@ -2166,12 +2249,14 @@ private:
                     res.bConverge = false;
                     break;
                 }
-                double newK1 = K1adj(tnew, q);
+                double newK1 = 0.0;
+                double newK2 = 0.0;
+                evalK1K2(tnew, q_val, newK1, newK2);
                 if(sgn(K1eval) != sgn(newK1)){
                     double absTnewT1 = std::abs(tnew - t1);
                     if(absTnewT1 > prevJump - thresh){
                         tnew = t1 + sgn(newK1 - K1eval) * prevJump * 0.5;
-                        newK1 = K1adj(tnew, q);
+                        evalK1K2(tnew, q_val, newK1, newK2);
                         prevJump = prevJump * 0.5;
                     }else{
                         prevJump = absTnewT1;
@@ -2180,73 +2265,92 @@ private:
                 nIter++;
                 t1 = tnew;
                 K1eval = newK1;
+                K2eval = newK2;
             }
             res.root = t1;
             res.nIter = nIter;
-            /*
-               if(!res.bConverge){
-               printVector(K1evals, "K1eval");
-               printVector(prevJumps, "prevJump");
-               printVector(K2evals, "K2eval");
-               printVector(newK1s, "newK1");
-               printVector(tnews, "tnew");
-            //output the tempory
-            }
-            */
             return(res);
         }
     }
 
 public:
-    static void setMu(VectorXd mu){
-        SPA::mu = mu.array();
-        //SPA::mu1 = 1.0 - SPA::mu;
-        //SPA::mu1mu = SPA::mu1 * SPA::mu;
-        SPA::nSample = mu.size();
+    static void setMu(const VectorXd &mu_in){
+        SPA::mu = mu_in;
+        SPA::oneMinusMu = 1.0 - mu_in.array();
+        SPA::dWpVec = mu_in.array() * SPA::oneMinusMu.array();
+        SPA::nSample = static_cast<int>(mu_in.size());
     }
 
-    SPA(double q, double qinv, Ref<VectorXd> rgen, const vector<uint32_t> &index){
-        this->q = q;
-        this->qinv = qinv;
-        //new (&geno) Map<VectorXd>(xp, nSample);
-        this->geno = rgen.array();
-        //LOGGER << "geno address: " << static_cast<void *>(geno.data()) << std::endl;
-        //LOGGER << "orig address: " << static_cast<void *>(rgen.data()) << std::endl;
-        //LOGGER.e(0, "debug");
-        //double gPos = (geno.array()>0).select(geno, 0).sum();
-        //double gNeg = (geno.array()<0).select(geno, 0).sum();
-        gPos = 0;
-        gNeg = 0;
-        for(int i = 0; i < nSample; i++){
-            double tgeno = geno[i];
-            if(tgeno > 0){
-                gPos+=tgeno;
-            }else{
-                gNeg+=tgeno;
-            }
-        }
+    SPA(double q_in, double qinv_in, Ref<VectorXd> rgen, const vector<uint32_t> &index, SPAWorkspace &workspace)
+        : q(q_in), qinv(qinv_in), gPos(0.0), gNeg(0.0), genoPtr(rgen.data()), ws(&workspace),
+          nNZ(static_cast<int>(index.size())), bFast(false), NAmu(0.0), NAsigma(0.0), totMuG(0.0), totMu1MuG(0.0) {
+        const double * __restrict g = genoPtr;
+        const double * __restrict m = mu.data();
+        const double * __restrict m1 = oneMinusMu.data();
+        const double * __restrict w = dWpVec.data();
 
-        mu1muG = mu * (1.0 - mu) * geno.square();
-
-        int nNZ = index.size();
-        bFast = false;
-        if((double)nNZ / nSample < 0.5){
+        if(static_cast<double>(nNZ) / nSample < 0.5){
             bFast = true;
-            muNZ.resize(nNZ);
-            mu1muNZG.resize(nNZ);
-            gNZ.resize(nNZ);
-            int curIndex = 0;
-            for(int i=0; i < nNZ; i++){
-                int tempIndex = index[i];
-                muNZ[curIndex] = mu[tempIndex];
-                mu1muNZG[curIndex] = mu1muG[tempIndex];
-                gNZ[curIndex] = geno[tempIndex];
-                curIndex++;
+            double gp = 0.0, gn = 0.0, swg2 = 0.0;
+            for(int i = 0; i < nSample; ++i){
+                const double gi = g[i];
+                gp += (gi > 0.0) ? gi : 0.0;
+                gn += (gi > 0.0) ? 0.0 : gi;
+                swg2 += w[i] * (gi * gi);
             }
+            gPos = gp;
+            gNeg = gn;
+            totMu1MuG = swg2;
 
-            NAmu = (qinv + q) * 0.5 - (gNZ * muNZ).sum();
-            NAsigma = mu1muG.sum() - mu1muNZG.sum();
-
+            if(static_cast<int>(ws->gNZ.size()) < nNZ){
+                ws->gNZ.resize(nNZ);
+                ws->muNZ.resize(nNZ);
+                ws->oneMinusMuNZ.resize(nNZ);
+                ws->muGNZ.resize(nNZ);
+                ws->mu1muNZG.resize(nNZ);
+            }
+            double sum_g_mu_nz = 0.0;
+            double sum_w_g2_nz = 0.0;
+            for(int i = 0; i < nNZ; ++i){
+                const uint32_t idx = index[i];
+                const double gi = g[idx];
+                const double mi = m[idx];
+                const double mgi = mi * gi;
+                const double wg2i = w[idx] * (gi * gi);
+                ws->gNZ[i] = gi;
+                ws->muNZ[i] = mi;
+                ws->oneMinusMuNZ[i] = m1[idx];
+                ws->muGNZ[i] = mgi;
+                ws->mu1muNZG[i] = wg2i;
+                sum_g_mu_nz += mgi;
+                sum_w_g2_nz += wg2i;
+            }
+            NAmu = (qinv + q) * 0.5 - sum_g_mu_nz;
+            NAsigma = totMu1MuG - sum_w_g2_nz;
+        }else{
+            bFast = false;
+            if(static_cast<int>(ws->muGFull.size()) < nSample){
+                ws->muGFull.resize(nSample);
+                ws->mu1muGFull.resize(nSample);
+            }
+            double * __restrict mg_out = ws->muGFull.data();
+            double * __restrict wg2_out = ws->mu1muGFull.data();
+            double gp = 0.0, gn = 0.0, smg = 0.0, swg2 = 0.0;
+            for(int i = 0; i < nSample; ++i){
+                const double gi = g[i];
+                const double mgi = m[i] * gi;
+                const double wg2i = w[i] * (gi * gi);
+                gp += (gi > 0.0) ? gi : 0.0;
+                gn += (gi > 0.0) ? 0.0 : gi;
+                mg_out[i] = mgi;
+                wg2_out[i] = wg2i;
+                smg += mgi;
+                swg2 += wg2i;
+            }
+            gPos = gp;
+            gNeg = gn;
+            totMuG = smg;
+            totMu1MuG = swg2;
         }
     }
 
@@ -2270,7 +2374,9 @@ public:
     }
 
 };
-ArrayXd SPA::mu;
+VectorXd SPA::mu;
+VectorXd SPA::oneMinusMu;
+VectorXd SPA::dWpVec;
 int SPA::nSample = 0;
 
 void FastFAM::loadBinModel(){
@@ -5970,6 +6076,13 @@ void FastFAM::processFAMreg(){
     int nMarker = 100;
 
     LOGGER.ts("LOOP_SET_TOT");
+    VectorXd GW1(num_indi);
+    VectorXd GW2;
+    if(bPreciseCovar){
+        GW2.resize(num_indi);
+    }
+    vector<uint32_t> index0;
+    SPAWorkspace spa_ws;
  
     for(int i = 0; i < numGeneBlock; i++){
         string genename = genelist[i].first;
@@ -6004,30 +6117,24 @@ void FastFAM::processFAMreg(){
         gX.conservativeResize(num_indi, nValidMarker);
         gN.conservativeResize(nValidMarker);
 
-        vector<bool> bFlip(nValidMarker, false);
         for(int j = 0; j < nValidMarker; j++){
             if(gAF(j) > 0.5){
                 double af = 1.0 - gAF(j);
                 gAF(j) = af;
                 gX.col(j) = -gX.col(j).array() + 2.0;
-                bFlip[j] = true;
             }
-
         }
 
         VectorXd weight = StatLib::weightBetaMAF(gAF, 1, 25);
-        SpMat weights(nValidMarker, nValidMarker);
-        weights.setIdentity();
-        weights.diagonal() = weight; 
+        GW1.noalias() = gX * weight;
 
-        MatrixXd GW = gX * weights;
-
-        VectorXd GW1 = GW * MatrixXd::Ones(nValidMarker, 1);
-        VectorXd GW2 = GW1;
+        double gw1_mean = 0.0;
         if(bPreciseCovar){
+            GW2 = GW1;
             conditionCovarBinReg(GW1);
         }else{
-            GW1 = GW1.array() - GW1.mean();
+            gw1_mean = GW1.mean();
+            GW1.array() -= gw1_mean;
         }
         double varSNP = std::sqrt(GW1.dot(dWp.cwiseProduct(GW1)) * c_inf);
         SPARes res;
@@ -6039,19 +6146,27 @@ void FastFAM::processFAMreg(){
         if( chisq < spaCutOff){
             res.p_adj = res.p;
         }else{
-            vector<uint32_t> index0;
-            index0.reserve(num_indi);
-            double thresh = 1e-6;
-            for(uint32_t i = 0; i < num_indi; i++){
-                if(GW2[i] > thresh){
-                    index0.push_back(i);
+            index0.clear();
+            if(bPreciseCovar){
+                const double thresh = 1e-6;
+                for(uint32_t k = 0; k < num_indi; k++){
+                    if(GW2[k] > thresh){
+                        index0.push_back(k);
+                    }
                 }
+            }else{
+                const double thresh = 1e-6 - gw1_mean;
+                for(uint32_t k = 0; k < num_indi; k++){
+                    if(GW1[k] > thresh){
+                        index0.push_back(k);
+                    }
+                }
+                conditionCovarBinReg(GW1);
             }
 
-            if(!bPreciseCovar) conditionCovarBinReg(GW1);
             double q = GW1.dot(phenoVec);
             double qinv = q - res.score - res.score;
-            SPA spa(q, qinv, GW1, index0);
+            SPA spa(q, qinv, GW1, index0, spa_ws);
             spa.saddleProb(&res);
         }
 
@@ -7475,6 +7590,7 @@ void FastFAM::calculate_spa(uintptr_t *genobuf, const vector<uint32_t> &markerIn
         GenoBufItem item;
         vector<double> xvec_raw_buf;
         vector<uint32_t> index0;
+        SPAWorkspace spa_ws;
         double hb_buf[128];
 
         #pragma omp for schedule(dynamic, 16)
@@ -7600,7 +7716,7 @@ void FastFAM::calculate_spa(uintptr_t *genobuf, const vector<uint32_t> &markerIn
 
                 double q = xvec.dot(phenoVec);
                 double qinv = q - res.score - res.score;
-                SPA spa(q, qinv, xvec, index0);
+                SPA spa(q, qinv, xvec, index0, spa_ws);
                 spa.saddleProb(&res);
             }
 
