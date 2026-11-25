@@ -57,17 +57,25 @@ ENV MKLROOT=/opt/intel/oneapi/mkl/latest \
 WORKDIR /src/gcta
 COPY . .
 
-# Statically link MKL (on amd64) + gsl/sqlite3/zstd/zlib with --gc-sections and strip
+# Statically link MKL (on amd64) + gsl/sqlite3/zstd/zlib with --gc-sections and strip.
+# Note: CMakeLists.txt only reads ARCH_FLAGS on arm64/aarch64 (where it otherwise defaults to
+# -march=native); on x86_64 it uses SSE (-msse2) instead, so only pass ARCH_FLAGS on arm64.
+ARG BUILD_JOBS=""
 RUN if [ ! -f submods/plink-ng/2.0/plink2_base.cc ]; then \
         rm -rf submods/plink-ng && \
         git clone --depth 1 https://github.com/chrchang/plink-ng.git submods/plink-ng; \
     fi && \
+    CMAKE_ARCH_ARG="" && \
+    if [ "${TARGETARCH:-amd64}" = "arm64" ]; then \
+        CMAKE_ARCH_ARG="-DARCH_FLAGS=-march=armv8-a"; \
+    fi && \
+    JOBS="${BUILD_JOBS:-$(awk -v c="$(nproc)" '/MemAvailable/ { m = int($2 / 2097152); if (m < 1) m = 1; print (c < m ? c : m) }' /proc/meminfo)}" && \
     cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DSTATIC_DEPS=ON \
         -DBUILD_TESTING=OFF \
-        -DARCH_FLAGS="-march=armv8-a" && \
-    cmake --build build -j"$(nproc)" && \
+        ${CMAKE_ARCH_ARG} && \
+    cmake --build build -j"${JOBS}" && \
     strip --strip-unneeded build/gcta64 && \
     MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" && \
     mkdir -p "/runtime-root/usr/lib/${MULTIARCH}" && \
