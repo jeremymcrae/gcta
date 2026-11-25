@@ -240,6 +240,12 @@ static inline void extractMissingIndicesFromPacked(const uintptr_t *packed, uint
     }
 }
 
+struct SparseTriplet {
+    int32_t id1;
+    int32_t id2;
+    float val;
+};
+
 } // namespace
 
 map<string, string> GRM::options;
@@ -380,6 +386,11 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
     LOGGER.i(0, "Subtracting GRMs...");
     FILE *ho_grm = fopen((out_file + ".grm.bin").c_str(), "wb");
     FILE *ho_grmN = fopen((out_file + ".grm.N.bin").c_str(), "wb");
+    if(!ho_grm || !ho_grmN){
+        LOGGER.e(0, "can't write to [" + out_file + ".grm.bin/.grm.N.bin].");
+    }
+    setvbuf(ho_grm, NULL, _IOFBF, 4 * 1024 * 1024);
+    setvbuf(ho_grmN, NULL, _IOFBF, 4 * 1024 * 1024);
 
     for(int i = 0; i < loop_num; i++){
         if(i == loop_num - 1 && remain_item != 0) itemRead = remain_item;
@@ -387,9 +398,12 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
         readBytes(h_grm2, itemRead, buf2);
         readBytes(h_grmN1, itemRead, bufN1);
         readBytes(h_grmN2, itemRead, bufN2);
-        for(int j = 0; j < itemRead; j++){
-            bufN[j] = bufN1[j] - bufN2[j];
-            buf[j] = (float)(((double)buf1[j] * bufN1[j] - (double)buf2[j] * bufN2[j]) / bufN[j]);
+        const int64_t n_items = static_cast<int64_t>(itemRead);
+        #pragma omp parallel for schedule(static)
+        for(int64_t j = 0; j < n_items; j++){
+            const float diffN = bufN1[j] - bufN2[j];
+            bufN[j] = diffN;
+            buf[j] = (float)(((double)buf1[j] * bufN1[j] - (double)buf2[j] * bufN2[j]) / diffN);
         }
         if(fwrite(buf, sizeof(float), itemRead, ho_grm) != itemRead){
             LOGGER.e(0, "can't write to [" + out_file + ".grm.bin].");
@@ -398,6 +412,12 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
             LOGGER.e(0, "can't write to [" + out_file + ".grm.N.bin].");
         }
     }
+    fclose(h_grm1);
+    fclose(h_grmN1);
+    fclose(h_grm2);
+    fclose(h_grmN2);
+    fclose(ho_grm);
+    fclose(ho_grmN);
     LOGGER.i(0, "The subtracted GRM has been written to [" + out_file + ".grm.bin, .grm.N.bin].");
 
     delete[] buf1;
@@ -504,7 +524,7 @@ void GRM::unify_grm(string mgrm_file, string out_file){
         vector_commonIndex_sorted1(common_id, ids[i], index1, grm_indices[i]);
         std::ofstream out_id(id_file_name.c_str());
         for(auto & index: grm_indices[i]){
-            out_id << ids[i][index] << std::endl;
+            out_id << ids[i][index] << '\n';
         }
         out_id.close();
         LOGGER.i(0, "Unified individual IDs have been saved to [" + id_file_name + "].");
@@ -527,45 +547,123 @@ void GRM::unify_grm(string mgrm_file, string out_file){
         if(!h_wgrm){
             LOGGER.e(0, "can't write to " + wfile_name + ".");
         }
+        setvbuf(h_grm, NULL, _IOFBF, 4 * 1024 * 1024);
+        setvbuf(h_wgrm, NULL, _IOFBF, 4 * 1024 * 1024);
+
+        bool is_monotonic = true;
+        bool is_identity = (size_grm == largest_grm_size);
+        for(uint32_t j = 0; j < size_grm; j++){
+            if(p_index[j] != j) is_identity = false;
+            if(j > 0 && p_index[j] <= p_index[j - 1]) is_monotonic = false;
+        }
 
         float *buf = new float[largest_grm_size];
         float *wbuf = new float[size_grm];
 
-        vector<uint64_t> start_pos(largest_grm_size);
-        for(int j = 0; j < largest_grm_size; j++){
-            uint64_t byte_start_grm = (1 + j) * j / 2 * sizeof(float);
-            start_pos[j] = byte_start_grm;
-        }
-
-        for(int j = 0; j < size_grm; j++){
-            uint64_t grm_index = p_index[j];
-            uint64_t num_grm = grm_index + 1;
-            uint64_t byte_start_grm = start_pos[grm_index];
-            fseek(h_grm, byte_start_grm, SEEK_SET);
-            if(fread(buf, sizeof(float), num_grm, h_grm) != num_grm){
-                LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(ftell(h_grm)), ".");
+        if(is_monotonic){
+            uint64_t cur_file_row = 0;
+            for(uint32_t j = 0; j < size_grm; j++){
+                const uint64_t grm_index = p_index[j];
+                const uint64_t num_grm = grm_index + 1;
+                if(grm_index != cur_file_row){
+                    const uint64_t byte_start_grm = (1ULL + grm_index) * grm_index / 2ULL * sizeof(float);
+                    fseek(h_grm, byte_start_grm, SEEK_SET);
+                }
+                if(fread(buf, sizeof(float), num_grm, h_grm) != num_grm){
+                    LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(ftell(h_grm)), ".");
+                }
+                cur_file_row = grm_index + 1;
+                const uint64_t size_write = j + 1;
+                const float *write_ptr = buf;
+                if(!is_identity){
+                    for(uint32_t k = 0; k < size_write; k++){
+                        wbuf[k] = buf[p_index[k]];
+                    }
+                    write_ptr = wbuf;
+                }
+                if(size_write != fwrite(write_ptr, sizeof(float), size_write, h_wgrm)){
+                    LOGGER.e(0, "error in writing to [" + wfile_name + "], pos: " + std::to_string(ftell(h_wgrm)) + ".");
+                }
             }
-            uint64_t size_write = j + 1;
-            for(int k = 0; k < size_write; k++){
-                uint32_t cur_index = p_index[k];
-                float grm_value;
-                if(cur_index < num_grm){
-                    grm_value = *(buf + cur_index);
-                }else{
-                    //fill the other parts
-                    auto bytes_offset = start_pos[cur_index] + grm_index * sizeof(float);
-                    fseek(h_grm, bytes_offset, SEEK_SET); 
-                    if(fread(&grm_value, sizeof(float), 1, h_grm) != 1){
-                        LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(bytes_offset), ".");
+        }else{
+            vector<int32_t> inv_map(largest_grm_size, -1);
+            bool injective = true;
+            for(uint32_t j = 0; j < size_grm; j++){
+                if(inv_map[p_index[j]] != -1){
+                    injective = false;
+                    break;
+                }
+                inv_map[p_index[j]] = static_cast<int32_t>(j);
+            }
+            const uint64_t max_stripe_floats = 128ULL * 1024ULL * 1024ULL; // 512 MB
+            if(injective){
+                uint32_t d0 = 0;
+                vector<float> out_stripe;
+                while(d0 < size_grm){
+                    uint32_t d1 = d0;
+                    uint64_t stripe_elems = 0;
+                    while(d1 < size_grm){
+                        const uint64_t next_row_len = static_cast<uint64_t>(d1) + 1ULL;
+                        if(stripe_elems + next_row_len > max_stripe_floats && d1 > d0) break;
+                        stripe_elems += next_row_len;
+                        d1++;
+                    }
+                    out_stripe.resize(stripe_elems);
+                    const uint64_t base_elem_off = static_cast<uint64_t>(d0) * (static_cast<uint64_t>(d0) + 1ULL) / 2ULL;
+                    fseek(h_grm, 0, SEEK_SET);
+                    for(uint32_t src_r = 0; src_r < largest_grm_size; src_r++){
+                        const uint64_t num_grm = static_cast<uint64_t>(src_r) + 1ULL;
+                        if(fread(buf, sizeof(float), num_grm, h_grm) != num_grm){
+                            LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(ftell(h_grm)), ".");
+                        }
+                        const int32_t dst_r = inv_map[src_r];
+                        if(dst_r < 0) continue;
+                        for(uint32_t src_c = 0; src_c <= src_r; src_c++){
+                            const int32_t dst_c = inv_map[src_c];
+                            if(dst_c < 0) continue;
+                            const uint32_t hi = static_cast<uint32_t>(std::max(dst_r, dst_c));
+                            if(hi < d0 || hi >= d1) continue;
+                            const uint32_t lo = static_cast<uint32_t>(std::min(dst_r, dst_c));
+                            const uint64_t pos = static_cast<uint64_t>(hi) * (static_cast<uint64_t>(hi) + 1ULL) / 2ULL - base_elem_off + lo;
+                            out_stripe[pos] = buf[src_c];
+                        }
+                    }
+                    if(stripe_elems != fwrite(out_stripe.data(), sizeof(float), stripe_elems, h_wgrm)){
+                        LOGGER.e(0, "error in writing to [" + wfile_name + "], pos: " + std::to_string(ftell(h_wgrm)) + ".");
+                    }
+                    d0 = d1;
+                }
+            }else{
+                vector<uint64_t> start_pos(largest_grm_size);
+                for(uint32_t j = 0; j < largest_grm_size; j++){
+                    start_pos[j] = (1ULL + j) * j / 2ULL * sizeof(float);
+                }
+                for(uint32_t j = 0; j < size_grm; j++){
+                    uint64_t grm_index = p_index[j];
+                    uint64_t num_grm = grm_index + 1;
+                    fseek(h_grm, start_pos[grm_index], SEEK_SET);
+                    if(fread(buf, sizeof(float), num_grm, h_grm) != num_grm){
+                        LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(ftell(h_grm)), ".");
+                    }
+                    uint64_t size_write = j + 1;
+                    for(uint32_t k = 0; k < size_write; k++){
+                        uint32_t cur_index = p_index[k];
+                        float grm_value;
+                        if(cur_index < num_grm){
+                            grm_value = buf[cur_index];
+                        }else{
+                            uint64_t bytes_offset = start_pos[cur_index] + grm_index * sizeof(float);
+                            fseek(h_grm, bytes_offset, SEEK_SET);
+                            if(fread(&grm_value, sizeof(float), 1, h_grm) != 1){
+                                LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(bytes_offset), ".");
+                            }
+                        }
+                        wbuf[k] = grm_value;
+                    }
+                    if(size_write != fwrite(wbuf, sizeof(float), size_write, h_wgrm)){
+                        LOGGER.e(0, "error in writing to [" + wfile_name + "], pos: " + std::to_string(ftell(h_wgrm)) + ".");
                     }
                 }
-                *(wbuf + k) = grm_value;
-            }
-            //last element
-            //*(wbuf + j) = *(buf + grm_index);
-
-            if(size_write != fwrite(wbuf, sizeof(float), size_write, h_wgrm)){
-                LOGGER.e(0, "error in writing to [" + wfile_name + "], pos: " + std::to_string(ftell(h_wgrm)) + "."); 
             }
         }
         delete[] buf;
@@ -581,16 +679,21 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
     LOGGER.i(0, "Pruning the GRM to a sparse matrix with a cutoff of " + to_string(thresh) + "...");
     LOGGER.i(0, "Total number of parts to be processed: " + to_string(index_grm_pairs.size()));
     FILE *grmFile = fopen((grm_file + ".grm.bin").c_str(), "rb");
+    if(!grmFile) LOGGER.e(0, "can't open " + grm_file + ".grm.bin");
+    setvbuf(grmFile, NULL, _IOFBF, 4 * 1024 * 1024);
 
     std::ofstream o_id((options["out"] + ".grm.id").c_str());
     if(!o_id) LOGGER.e(0, "can't write to [" + options["out"] + ".grm.id]");
-    std::ofstream o_fam;
-    FILE* o_bk;
+    FILE* o_fam = NULL;
+    FILE* o_bk = NULL;
     if(isSparse){
-        o_fam.open((options["out"] + ".grm.sp").c_str());
+        o_fam = fopen((options["out"] + ".grm.sp").c_str(), "wb");
         if(!o_fam) LOGGER.e(0, "can't write to [" + options["out"] + ".grm.sp]");
+        setvbuf(o_fam, NULL, _IOFBF, 4 * 1024 * 1024);
     }else{
         o_bk = fopen((options["out"] + ".grm.bin").c_str(), "wb");
+        if(!o_bk) LOGGER.e(0, "can't write to [" + options["out"] + ".grm.bin]");
+        setvbuf(o_bk, NULL, _IOFBF, 4 * 1024 * 1024);
     }
 
     //Save the kept IDs, which may change by --keep and --remove
@@ -605,90 +708,170 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
     keep_ID.clear();
     keep_ID.shrink_to_fit();
 
+    const bool all_kept = (index_keep.size() == num_subjects);
+    vector<int32_t> orig_to_new(num_subjects, -1);
+    for(size_t k = 0; k < index_keep.size(); ++k){
+        orig_to_new[index_keep[k]] = static_cast<int32_t>(k);
+    }
 
-    // Save pair1 par2 GRM
-    std::unordered_set<int> keeps_ori(index_keep.begin(), index_keep.end());
     float *grm_buf = new float[num_byte_buffer];
-    float cur_grm, *cur_grm_pos0;
-    vector<float> rm_grm;
-    vector<int> rm_grm_ID1, rm_grm_ID2;
-    float *out_grm_buf = new float[num_byte_buffer];
-    float *cur_grm_buf;
-    int new_id1 = 0;
-    for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
+    float *out_grm_buf = isSparse ? NULL : new float[num_byte_buffer];
+    vector<SparseTriplet> triplets;
+    const int n_threads = std::max(1, omp_get_max_threads());
+    vector<vector<SparseTriplet>> thread_triplets(isSparse ? n_threads : 0);
+    vector<size_t> in_row_off;
+    vector<size_t> out_row_off;
+
+    for(size_t part_index = 0; part_index != index_grm_pairs.size(); part_index++){
         if(fread(grm_buf, sizeof(float), byte_part_grms[part_index], grmFile) != byte_part_grms[part_index]){
             LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
-        };
+        }
         if(part_index % 50 == 0){
             LOGGER.i(2, "Processing part " + to_string(part_index + 1));
         }
-        cur_grm_pos0 = grm_buf;
-        cur_grm_buf = out_grm_buf;
+        const int r_first = index_grm_pairs[part_index].first;
+        const int r_last = index_grm_pairs[part_index].second;
+        const int n_rows = r_last - r_first + 1;
 
-        for(int id1 = index_grm_pairs[part_index].first; id1 != index_grm_pairs[part_index].second + 1; id1++){
-            if (keeps_ori.find(id1) == keeps_ori.end()) {
-                cur_grm_pos0 += id1 + 1;
-                continue;
-            }
-            int new_id2 = 0;
-            if(value){
-                for(int id2 : index_keep){
-                    if(id2 > id1) break;
-                    cur_grm = *(cur_grm_pos0 + id2);
-                    if(cur_grm > thresh){
-                        rm_grm_ID1.push_back(new_id1);
-                        rm_grm_ID2.push_back(new_id2);
-                        rm_grm.push_back(*value);
-                        *(cur_grm_buf++) = (*value);
-                    }else{
-                        *(cur_grm_buf++) = 0.0;
-                    }
-                    new_id2++;
-                }
- 
-            }else{
-                for(int id2 : index_keep){
-                    if(id2 > id1) break;
-                    cur_grm = *(cur_grm_pos0 + id2);
-                    if(cur_grm > thresh){
-                        rm_grm_ID1.push_back(new_id1);
-                        rm_grm_ID2.push_back(new_id2);
-                        rm_grm.push_back(cur_grm);
-                        *(cur_grm_buf++) = cur_grm;
-                    }else{
-                        *(cur_grm_buf++) = 0.0;
-                    }
-                    new_id2++;
-                }
-            }
-            new_id1++;
-            cur_grm_pos0 += id1 + 1;
-        }
+        in_row_off.resize(n_rows + 1);
+        in_row_off[0] = 0;
         if(!isSparse){
-            int write_items = cur_grm_buf - out_grm_buf;
-            if(fwrite(out_grm_buf, sizeof(float), write_items, o_bk) != write_items){
-                LOGGER.e(0, "Failed to write the output"); 
+            out_row_off.resize(n_rows + 1);
+            out_row_off[0] = 0;
+        }
+        for(int r = 0; r < n_rows; ++r){
+            const int id1 = r_first + r;
+            in_row_off[r + 1] = in_row_off[r] + static_cast<size_t>(id1 + 1);
+            if(!isSparse){
+                const int32_t new_id1 = orig_to_new[id1];
+                out_row_off[r + 1] = out_row_off[r] + (new_id1 >= 0 ? static_cast<size_t>(new_id1 + 1) : 0);
             }
         }
 
+        if(isSparse){
+            const bool has_set_val = (value != NULL);
+            const float fixed_val = has_set_val ? (*value) : 0.0f;
+            #pragma omp parallel num_threads(n_threads)
+            {
+                const int tid = omp_get_thread_num();
+                vector<SparseTriplet> &local_vec = thread_triplets[tid];
+                local_vec.clear();
+                #pragma omp for schedule(static)
+                for(int r = 0; r < n_rows; ++r){
+                    const int id1 = r_first + r;
+                    const int32_t new_id1 = orig_to_new[id1];
+                    if(new_id1 < 0) continue;
+                    const float *row_ptr = grm_buf + in_row_off[r];
+                    if(all_kept){
+                        for(int id2 = 0; id2 <= id1; ++id2){
+                            const float cur_grm = row_ptr[id2];
+                            if(cur_grm > thresh){
+                                SparseTriplet tr;
+                                tr.id1 = new_id1;
+                                tr.id2 = id2;
+                                tr.val = has_set_val ? fixed_val : cur_grm;
+                                local_vec.push_back(tr);
+                            }
+                        }
+                    }else{
+                        for(int32_t new_id2 = 0; new_id2 <= new_id1; ++new_id2){
+                            const float cur_grm = row_ptr[index_keep[new_id2]];
+                            if(cur_grm > thresh){
+                                SparseTriplet tr;
+                                tr.id1 = new_id1;
+                                tr.id2 = new_id2;
+                                tr.val = has_set_val ? fixed_val : cur_grm;
+                                local_vec.push_back(tr);
+                            }
+                        }
+                    }
+                }
+            }
+            size_t add_total = 0;
+            for(int t = 0; t < n_threads; ++t) add_total += thread_triplets[t].size();
+            if(add_total > 0){
+                triplets.reserve(triplets.size() + add_total);
+                for(int t = 0; t < n_threads; ++t){
+                    triplets.insert(triplets.end(), thread_triplets[t].begin(), thread_triplets[t].end());
+                }
+            }
+        }else{
+            const bool has_set_val = (value != NULL);
+            const float fixed_val = has_set_val ? (*value) : 0.0f;
+            #pragma omp parallel for schedule(static)
+            for(int r = 0; r < n_rows; ++r){
+                const int id1 = r_first + r;
+                const int32_t new_id1 = orig_to_new[id1];
+                if(new_id1 < 0) continue;
+                const float *row_ptr = grm_buf + in_row_off[r];
+                float *dst_ptr = out_grm_buf + out_row_off[r];
+                if(all_kept){
+                    if(has_set_val){
+                        for(int id2 = 0; id2 <= id1; ++id2){
+                            dst_ptr[id2] = (row_ptr[id2] > thresh) ? fixed_val : 0.0f;
+                        }
+                    }else{
+                        for(int id2 = 0; id2 <= id1; ++id2){
+                            const float cur_grm = row_ptr[id2];
+                            dst_ptr[id2] = (cur_grm > thresh) ? cur_grm : 0.0f;
+                        }
+                    }
+                }else{
+                    if(has_set_val){
+                        for(int32_t new_id2 = 0; new_id2 <= new_id1; ++new_id2){
+                            dst_ptr[new_id2] = (row_ptr[index_keep[new_id2]] > thresh) ? fixed_val : 0.0f;
+                        }
+                    }else{
+                        for(int32_t new_id2 = 0; new_id2 <= new_id1; ++new_id2){
+                            const float cur_grm = row_ptr[index_keep[new_id2]];
+                            dst_ptr[new_id2] = (cur_grm > thresh) ? cur_grm : 0.0f;
+                        }
+                    }
+                }
+            }
+            const size_t write_items = out_row_off[n_rows];
+            if(fwrite(out_grm_buf, sizeof(float), write_items, o_bk) != write_items){
+                LOGGER.e(0, "Failed to write the output");
+            }
+        }
     }
+
     delete [] grm_buf;
-    delete [] out_grm_buf;
+    if(out_grm_buf) delete [] out_grm_buf;
     fclose(grmFile);
     if(!isSparse){
         fclose(o_bk);
     }
 
     if(isSparse){
-        LOGGER.i(0, "Saving the sparse GRM (" + to_string(rm_grm.size()) + " pairs) to [" + options["out"] + ".grm.sp]");
-        //    auto sorted_index = sort_indexes(rm_grm_ID2, rm_grm_ID1);
-        //    for(auto index : sorted_index){
-        o_fam << std::setprecision( std::numeric_limits<float>::digits10+2);
-        for(int index = 0; index != rm_grm.size(); index++){
-            o_fam << rm_grm_ID1[index] << "\t" << rm_grm_ID2[index] << "\t" << rm_grm[index] << std::endl;
+        LOGGER.i(0, "Saving the sparse GRM (" + to_string(triplets.size()) + " pairs) to [" + options["out"] + ".grm.sp]");
+        const size_t total_pairs = triplets.size();
+        const size_t kChunkPairs = 65536;
+        const size_t n_chunks = (total_pairs + kChunkPairs - 1) / kChunkPairs;
+        const size_t batch_chunks = static_cast<size_t>(n_threads) * 4;
+        vector<string> chunk_strs(std::min(n_chunks, batch_chunks));
+        for(size_t c0 = 0; c0 < n_chunks; c0 += batch_chunks){
+            const size_t c_cnt = std::min(batch_chunks, n_chunks - c0);
+            #pragma omp parallel for schedule(static)
+            for(int dc = 0; dc < static_cast<int>(c_cnt); ++dc){
+                const size_t p_beg = (c0 + static_cast<size_t>(dc)) * kChunkPairs;
+                const size_t p_end = std::min(total_pairs, p_beg + kChunkPairs);
+                std::ostringstream ss;
+                ss << std::setprecision(std::numeric_limits<float>::digits10 + 2);
+                for(size_t p = p_beg; p < p_end; ++p){
+                    ss << triplets[p].id1 << '\t' << triplets[p].id2 << '\t' << triplets[p].val << '\n';
+                }
+                chunk_strs[dc] = ss.str();
+            }
+            for(size_t dc = 0; dc < c_cnt; ++dc){
+                const string &s = chunk_strs[dc];
+                if(!s.empty() && fwrite(s.data(), 1, s.size(), o_fam) != s.size()){
+                    LOGGER.e(0, "Failed to write to [" + options["out"] + ".grm.sp]");
+                }
+            }
         }
-        o_fam.close();
+        fclose(o_fam);
         LOGGER.i(0, "Success:", "finished generating a sparse GRM");
         return;
     }else{
@@ -696,43 +879,66 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
     }
 
     FILE *NFile = fopen((grm_file + ".grm.N.bin").c_str(), "rb");
+    if(!NFile){
+        LOGGER.w(0, "Reading GRM N failed: cannot open [" + grm_file + ".grm.N.bin]");
+        return;
+    }
     FILE *ONFile = fopen((options["out"] + ".grm.N.bin").c_str(), "wb");
+    if(!ONFile){
+        fclose(NFile);
+        LOGGER.e(0, "Failed to write the GRM N");
+    }
+    setvbuf(NFile, NULL, _IOFBF, 4 * 1024 * 1024);
+    setvbuf(ONFile, NULL, _IOFBF, 4 * 1024 * 1024);
     float *N_buf = new float[num_byte_buffer];
-    float *cur_N_pos0;
-    float *out_N_buf = new float[num_byte_buffer];
-    float *cur_N_buf;
-    for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
+    float *out_N_buf = all_kept ? NULL : new float[num_byte_buffer];
+    for(size_t part_index = 0; part_index != index_grm_pairs.size(); part_index++){
         if(fread(N_buf, sizeof(float), byte_part_grms[part_index], NFile) != byte_part_grms[part_index]){
             LOGGER.w(0, "Reading GRM N failed between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
             LOGGER.i(0, "Stop pruning the GRM N");
             break;
-        };
+        }
         if(part_index % 50 == 0){
             LOGGER.i(2, "Processing part " + to_string(part_index + 1));
         }
-        cur_N_pos0 = N_buf;
-        cur_N_buf = out_N_buf;
-
-        for(int id1 = index_grm_pairs[part_index].first; id1 != index_grm_pairs[part_index].second + 1; id1++){
-            if (keeps_ori.find(id1) == keeps_ori.end()) {
-                cur_N_pos0 += id1 + 1;
-                continue;
+        if(all_kept){
+            const size_t write_items = byte_part_grms[part_index];
+            if(fwrite(N_buf, sizeof(float), write_items, ONFile) != write_items){
+                LOGGER.e(0, "Failed to write the GRM N");
             }
-            for(int id2 : index_keep){
-                if(id2 > id1) break;
-                *(cur_N_buf++) = *(cur_N_pos0 + id2);
+        }else{
+            const int r_first = index_grm_pairs[part_index].first;
+            const int r_last = index_grm_pairs[part_index].second;
+            const int n_rows = r_last - r_first + 1;
+            in_row_off.resize(n_rows + 1);
+            out_row_off.resize(n_rows + 1);
+            in_row_off[0] = 0;
+            out_row_off[0] = 0;
+            for(int r = 0; r < n_rows; ++r){
+                const int id1 = r_first + r;
+                const int32_t new_id1 = orig_to_new[id1];
+                in_row_off[r + 1] = in_row_off[r] + static_cast<size_t>(id1 + 1);
+                out_row_off[r + 1] = out_row_off[r] + (new_id1 >= 0 ? static_cast<size_t>(new_id1 + 1) : 0);
             }
-            cur_N_pos0 += id1 + 1;
+            #pragma omp parallel for schedule(static)
+            for(int r = 0; r < n_rows; ++r){
+                const int id1 = r_first + r;
+                const int32_t new_id1 = orig_to_new[id1];
+                if(new_id1 < 0) continue;
+                const float *row_ptr = N_buf + in_row_off[r];
+                float *dst_ptr = out_N_buf + out_row_off[r];
+                for(int32_t new_id2 = 0; new_id2 <= new_id1; ++new_id2){
+                    dst_ptr[new_id2] = row_ptr[index_keep[new_id2]];
+                }
+            }
+            const size_t write_items = out_row_off[n_rows];
+            if(fwrite(out_N_buf, sizeof(float), write_items, ONFile) != write_items){
+                LOGGER.e(0, "Failed to write the GRM N");
+            }
         }
-
-        int write_items = cur_N_buf - out_N_buf;
-        if(fwrite(out_N_buf, sizeof(float), write_items, ONFile) != write_items){
-            LOGGER.e(0, "Failed to write the GRM N"); 
-        }
-
     }
-    delete [] out_N_buf;
+    if(out_N_buf) delete [] out_N_buf;
     delete [] N_buf;
     fclose(ONFile);
     fclose(NFile);
@@ -745,6 +951,8 @@ void GRM::cut_rel(float thresh, bool no_grm){
     LOGGER.i(0, "Pruning the GRM with a cutoff of " + to_string(thresh) + "...");
     LOGGER.i(0, "Total number of parts to be processed: " + to_string(index_grm_pairs.size()));
     FILE *grmFile = fopen((grm_file + ".grm.bin").c_str(), "rb");
+    if(!grmFile) LOGGER.e(0, "can't open " + grm_file + ".grm.bin");
+    setvbuf(grmFile, NULL, _IOFBF, 4 * 1024 * 1024);
     // put this first to avoid unwritable disk
     std::ofstream o_keep;
     if(!no_grm){
@@ -764,84 +972,115 @@ void GRM::cut_rel(float thresh, bool no_grm){
             LOGGER.e(0, "can't write to [" + options["out"] + ".family.txt, .singleton.txt]");
         }
     }
- 
 
-    std::unordered_set<int> keeps_ori(index_keep.begin(), index_keep.end());
+    const bool all_kept = (index_keep.size() == num_subjects);
+    vector<int32_t> orig_to_new(num_subjects, -1);
+    for(size_t k = 0; k < index_keep.size(); ++k){
+        orig_to_new[index_keep[k]] = static_cast<int32_t>(k);
+    }
 
     float *grm_buf = new float[num_byte_buffer];
-    float cur_grm, *cur_grm_pos0;
-    vector<float> rm_grm;
-    vector<int> rm_grm_ID1, rm_grm_ID2;
-    for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
+    vector<SparseTriplet> rel_pairs;
+    const int n_threads = std::max(1, omp_get_max_threads());
+    vector<vector<SparseTriplet>> thread_pairs(n_threads);
+    vector<size_t> in_row_off;
+
+    for(size_t part_index = 0; part_index != index_grm_pairs.size(); part_index++){
         if(fread(grm_buf, sizeof(float), byte_part_grms[part_index], grmFile) != byte_part_grms[part_index]){
             LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
-        };
+        }
         if(part_index % 50 == 0){
             LOGGER.i(2, "Processing part " + to_string(part_index + 1));
         }
-        cur_grm_pos0 = grm_buf;
-        for(int id1 = index_grm_pairs[part_index].first; id1 != index_grm_pairs[part_index].second + 1; id1++){
-            if (keeps_ori.find(id1) == keeps_ori.end()) {
-                cur_grm_pos0 += id1 + 1;
-                continue;
-            }
-            for(int id2 : index_keep){
-                if(id2 >= id1) break;
-                cur_grm = *(cur_grm_pos0 + id2);
-                if(cur_grm > thresh){
-                    rm_grm_ID1.push_back(id1);
-                    rm_grm_ID2.push_back(id2);
-                    rm_grm.push_back(cur_grm);
+        const int r_first = index_grm_pairs[part_index].first;
+        const int r_last = index_grm_pairs[part_index].second;
+        const int n_rows = r_last - r_first + 1;
+        in_row_off.resize(n_rows + 1);
+        in_row_off[0] = 0;
+        for(int r = 0; r < n_rows; ++r){
+            in_row_off[r + 1] = in_row_off[r] + static_cast<size_t>(r_first + r + 1);
+        }
+
+        #pragma omp parallel num_threads(n_threads)
+        {
+            const int tid = omp_get_thread_num();
+            vector<SparseTriplet> &local_vec = thread_pairs[tid];
+            local_vec.clear();
+            #pragma omp for schedule(static)
+            for(int r = 0; r < n_rows; ++r){
+                const int id1 = r_first + r;
+                const int32_t new_id1 = orig_to_new[id1];
+                if(new_id1 < 0) continue;
+                const float *row_ptr = grm_buf + in_row_off[r];
+                if(all_kept){
+                    for(int id2 = 0; id2 < id1; ++id2){
+                        const float cur_grm = row_ptr[id2];
+                        if(cur_grm > thresh){
+                            SparseTriplet tr;
+                            tr.id1 = id1;
+                            tr.id2 = id2;
+                            tr.val = cur_grm;
+                            local_vec.push_back(tr);
+                        }
+                    }
+                }else{
+                    for(int32_t new_id2 = 0; new_id2 < new_id1; ++new_id2){
+                        const int id2 = static_cast<int>(index_keep[new_id2]);
+                        const float cur_grm = row_ptr[id2];
+                        if(cur_grm > thresh){
+                            SparseTriplet tr;
+                            tr.id1 = id1;
+                            tr.id2 = id2;
+                            tr.val = cur_grm;
+                            local_vec.push_back(tr);
+                        }
+                    }
                 }
             }
-            cur_grm_pos0 += id1 + 1;
+        }
+        size_t add_total = 0;
+        for(int t = 0; t < n_threads; ++t) add_total += thread_pairs[t].size();
+        if(add_total > 0){
+            rel_pairs.reserve(rel_pairs.size() + add_total);
+            for(int t = 0; t < n_threads; ++t){
+                rel_pairs.insert(rel_pairs.end(), thread_pairs[t].begin(), thread_pairs[t].end());
+            }
         }
     }
     delete [] grm_buf;
 
     if(detail_flag){
-        for(int index = 0; index != rm_grm.size(); index++){
-            out_fam << grm_ids[rm_grm_ID1[index]] << "\t" <<  grm_ids[rm_grm_ID2[index]] << "\t" << rm_grm[index] << std::endl;
+        for(size_t index = 0; index != rel_pairs.size(); index++){
+            out_fam << grm_ids[rel_pairs[index].id1] << '\t' << grm_ids[rel_pairs[index].id2] << '\t' << rel_pairs[index].val << '\n';
         }
         out_fam.close();
         LOGGER.i(0, "Related family pairs have been saved to " + options["out"] + ".family.txt");
     }
 
-    int i_buf;
-    // copy from GCTA 1.26
-    vector<int> rm_uni_ID(rm_grm_ID1);
-    rm_uni_ID.insert(rm_uni_ID.end(), rm_grm_ID2.begin(), rm_grm_ID2.end());
-    stable_sort(rm_uni_ID.begin(), rm_uni_ID.end());
-    rm_uni_ID.erase(unique(rm_uni_ID.begin(), rm_uni_ID.end()), rm_uni_ID.end());
-    std::map<int, int> rm_uni_ID_count;
-    for (int i = 0; i < rm_uni_ID.size(); i++) {
-        i_buf = count(rm_grm_ID1.begin(), rm_grm_ID1.end(), rm_uni_ID[i]) + count(rm_grm_ID2.begin(), rm_grm_ID2.end(), rm_uni_ID[i]);
-        rm_uni_ID_count.insert(std::pair<int, int>(rm_uni_ID[i], i_buf));
+    // O(N + E) degree counting and greedy vertex removal (exact tie parity with GCTA 1.26)
+    vector<int> deg(num_subjects, 0);
+    for(size_t i = 0; i < rel_pairs.size(); ++i){
+        deg[rel_pairs[i].id1]++;
+        deg[rel_pairs[i].id2]++;
+    }
+    vector<uint8_t> removed_mask(num_subjects, 0);
+    for(size_t i = 0; i < rel_pairs.size(); ++i){
+        const int id1 = rel_pairs[i].id1;
+        const int id2 = rel_pairs[i].id2;
+        const int rm_id = (deg[id1] < deg[id2]) ? id2 : id1;
+        removed_mask[rm_id] = 1;
     }
 
-    // swapping
-    std::map<int, int>::iterator iter1, iter2;
-    for (int i = 0; i < rm_grm_ID1.size(); i++) {
-        iter1 = rm_uni_ID_count.find(rm_grm_ID1[i]);
-        iter2 = rm_uni_ID_count.find(rm_grm_ID2[i]);
-        if (iter1->second < iter2->second) {
-            i_buf = rm_grm_ID1[i];
-            rm_grm_ID1[i] = rm_grm_ID2[i];
-            rm_grm_ID2[i] = i_buf;
-        }
+    size_t removed_count = 0;
+    for(uint64_t id = 0; id < num_subjects; ++id){
+        if(removed_mask[id]) removed_count++;
     }
 
-    stable_sort(rm_grm_ID1.begin(), rm_grm_ID1.end());
-    rm_grm_ID1.erase(unique(rm_grm_ID1.begin(), rm_grm_ID1.end()), rm_grm_ID1.end());
-    vector<string> removed_ID;
-    removed_ID.reserve(rm_grm_ID1.size());
-    for (auto &index : rm_grm_ID1) removed_ID.push_back(grm_ids[index]);
-
-    auto diff = [&rm_grm_ID1](int value) ->bool{
-        return std::binary_search(rm_grm_ID1.begin(), rm_grm_ID1.end(), value);
-    };
-    index_keep.erase(std::remove_if(index_keep.begin(), index_keep.end(), diff), index_keep.end());
+    index_keep.erase(
+        std::remove_if(index_keep.begin(), index_keep.end(),
+                       [&removed_mask](uint32_t value) { return removed_mask[value] != 0; }),
+        index_keep.end());
 
     vector<string> keep_ID;
     keep_ID.reserve(index_keep.size());
@@ -849,7 +1088,7 @@ void GRM::cut_rel(float thresh, bool no_grm){
         keep_ID.emplace_back(grm_ids[index]);
     }
 
-    LOGGER.i(0, "After pruning the GRM, there are " + to_string(keep_ID.size()) + " individuals (" + to_string(removed_ID.size()) + " individuals removed).");
+    LOGGER.i(0, "After pruning the GRM, there are " + to_string(keep_ID.size()) + " individuals (" + to_string(removed_count) + " individuals removed).");
     if(!no_grm){
         std::copy(keep_ID.begin(), keep_ID.end(), std::ostream_iterator<string>(o_keep, "\n"));
         o_keep.close();
@@ -897,38 +1136,65 @@ void GRM::cut_rel(float thresh, bool no_grm){
 }
 
 void GRM::outBinFile(FILE *sFile, FILE *dFile) {
-    std::unordered_set<int> keeps(index_keep.begin(), index_keep.end());
+    setvbuf(sFile, NULL, _IOFBF, 4 * 1024 * 1024);
+    setvbuf(dFile, NULL, _IOFBF, 4 * 1024 * 1024);
+    const bool all_kept = (index_keep.size() == num_subjects);
+    vector<int32_t> orig_to_new(num_subjects, -1);
+    for(size_t k = 0; k < index_keep.size(); ++k){
+        orig_to_new[index_keep[k]] = static_cast<int32_t>(k);
+    }
+
     float *grm_buf = new float[num_byte_buffer];
-    float *grm_out_buffer = new float[num_byte_buffer];
-    float *cur_grm_pos, *cur_out_pos;
-    for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
+    float *grm_out_buffer = all_kept ? NULL : new float[num_byte_buffer];
+    vector<size_t> in_row_off;
+    vector<size_t> out_row_off;
+
+    for(size_t part_index = 0; part_index != index_grm_pairs.size(); part_index++){
         if(fread(grm_buf, sizeof(float), byte_part_grms[part_index], sFile) != byte_part_grms[part_index]){
             LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
-        };
+        }
         if(part_index % 50 == 0){
             LOGGER.i(2, "Processing part " + to_string(part_index + 1));
         }
-        cur_grm_pos = grm_buf;
-        cur_out_pos = grm_out_buffer;
-        for(int id1 = index_grm_pairs[part_index].first; id1 != index_grm_pairs[part_index].second + 1; id1++) {
-            if (keeps.find(id1) == keeps.end()) {
-                cur_grm_pos += id1 + 1;
-                continue;
+        if(all_kept){
+            const uint64_t size_write = byte_part_grms[part_index];
+            if(fwrite(grm_buf, sizeof(float), size_write, dFile) != size_write){
+                LOGGER.e(0, "Failed to write the output file, please check the disk condition or permission");
             }
-            for (int id2 : index_keep) {
-                if(id2 > id1) break;
-                *(cur_out_pos++) = *(cur_grm_pos + id2);
+        }else{
+            const int r_first = index_grm_pairs[part_index].first;
+            const int r_last = index_grm_pairs[part_index].second;
+            const int n_rows = r_last - r_first + 1;
+            in_row_off.resize(n_rows + 1);
+            out_row_off.resize(n_rows + 1);
+            in_row_off[0] = 0;
+            out_row_off[0] = 0;
+            for(int r = 0; r < n_rows; ++r){
+                const int id1 = r_first + r;
+                const int32_t new_id1 = orig_to_new[id1];
+                in_row_off[r + 1] = in_row_off[r] + static_cast<size_t>(id1 + 1);
+                out_row_off[r + 1] = out_row_off[r] + (new_id1 >= 0 ? static_cast<size_t>(new_id1 + 1) : 0);
             }
-            cur_grm_pos += id1 + 1;
+            #pragma omp parallel for schedule(static)
+            for(int r = 0; r < n_rows; ++r){
+                const int id1 = r_first + r;
+                const int32_t new_id1 = orig_to_new[id1];
+                if(new_id1 < 0) continue;
+                const float *row_ptr = grm_buf + in_row_off[r];
+                float *dst_ptr = grm_out_buffer + out_row_off[r];
+                for(int32_t new_id2 = 0; new_id2 <= new_id1; ++new_id2){
+                    dst_ptr[new_id2] = row_ptr[index_keep[new_id2]];
+                }
+            }
+            const uint64_t size_write = out_row_off[n_rows];
+            if(fwrite(grm_out_buffer, sizeof(float), size_write, dFile) != size_write){
+                LOGGER.e(0, "Failed to write the output file, please check the disk condition or permission");
+            }
         }
-        uint64_t size_write = cur_out_pos - grm_out_buffer;
-        if(fwrite(grm_out_buffer, sizeof(float), size_write, dFile) != size_write){
-            LOGGER.e(0, "Failed to write the output file, please check the disk condition or permission");
-        };
     }
     delete [] grm_buf;
-    delete [] grm_out_buffer;
+    if(grm_out_buffer) delete [] grm_out_buffer;
 }
 
 
