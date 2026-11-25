@@ -516,6 +516,10 @@ bool PgenReader::CountHardFreqMissExtX(uintptr_t *buf, const uintptr_t *subset_i
         errmsg = "het";
         retVal = false;
     }
+    snpinfo->genocounts[0] = genocounts[0];
+    snpinfo->genocounts[1] = genocounts[1];
+    snpinfo->genocounts[2] = genocounts[2];
+    snpinfo->genocounts[3] = genocounts[3];
     snpinfo->N = keepSize - genocounts[3];
     snpinfo->AlCount = 2 * snpinfo->N - genocounts2[0] - genocounts2[1] - genocounts2[2];
     snpinfo->nMissRate = 1.0 * snpinfo->N / keepSize;

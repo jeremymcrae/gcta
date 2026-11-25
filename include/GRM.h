@@ -139,6 +139,12 @@ private:
     uint32_t numValidMarkers = 0;
 
     GenoBufItem *gbufitems = NULL;
+    vector<int> validIndexBuf;
+    vector<int> sparseMissMarkers;
+    vector<uintptr_t> denseMissMask;
+    vector<int> denseNonZeroIdx;
+    int denseMissCount = 0;
+    void flushDenseMissingBlock();
 
     //Just for testing
 #ifndef NDEBUG

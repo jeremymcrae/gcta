@@ -38,6 +38,210 @@
 
 using std::to_string;
 
+#if GCTA_CPU_ARM || defined(OPENBLAS_CONST)
+extern "C" {
+int openblas_get_num_threads(void);
+void openblas_set_num_threads(int num_threads);
+}
+#endif
+
+namespace {
+
+struct ScopedSingleThreadBLAS {
+    int prev_omp;
+#if GCTA_CPU_ARM || defined(OPENBLAS_CONST)
+    int prev_threads;
+    ScopedSingleThreadBLAS()
+        : prev_omp(omp_get_max_threads()),
+          prev_threads(openblas_get_num_threads()) {
+        openblas_set_num_threads(1);
+        omp_set_num_threads(prev_omp);
+    }
+    ~ScopedSingleThreadBLAS() {
+        openblas_set_num_threads(prev_threads > 0 ? prev_threads : prev_omp);
+        omp_set_num_threads(prev_omp);
+    }
+#else
+    ScopedSingleThreadBLAS() : prev_omp(omp_get_max_threads()) {}
+    ~ScopedSingleThreadBLAS() {}
+#endif
+    struct ThreadLocal {
+        ThreadLocal() {
+#if GCTA_CPU_x86
+            mkl_set_num_threads_local(1);
+#endif
+        }
+        ~ThreadLocal() {
+#if GCTA_CPU_x86
+            mkl_set_num_threads_local(0);
+#endif
+        }
+    };
+};
+
+static inline int chooseGrmTileNB(double area, int nthreads) {
+    if (nthreads <= 1) return 768;
+    const double target_tiles = 8.0 * static_cast<double>(nthreads);
+    int nb = static_cast<int>( std::sqrt(area / target_tiles) );
+    nb = ((nb + 32) / 64) * 64;
+    if (nb < 128) nb = 128;
+    if (nb > 768) nb = 768;
+    return nb;
+}
+
+// 2D cache-tiled OpenMP lower-triangular C += A * A^T using 1-thread BLAS kernels per tile.
+// Caller must hold ScopedSingleThreadBLAS.
+static void parallelTiledSyrkLower(int n, int k, const double *A, int lda, double *C, int ldc) {
+    if (n <= 0 || k <= 0) return;
+    char uplo = 'L', notrans = 'N', trans = 'T';
+    double alpha = 1.0, beta = 1.0;
+    const int nthreads = omp_get_max_threads();
+    if (nthreads <= 1 || n <= 256) {
+#if GCTA_CPU_x86
+        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+        dsyrk(&uplo, &notrans, &n, &k, &alpha, A, &lda, &beta, C, &ldc);
+#else
+        dsyrk_(&uplo, &notrans, &n, &k, &alpha, A, &lda, &beta, C, &ldc);
+#endif
+        return;
+    }
+
+    const int NB = chooseGrmTileNB(0.5 * static_cast<double>(n) * static_cast<double>(n), nthreads);
+    const int nblk = (n + NB - 1) / NB;
+    const int ntiles = nblk * (nblk + 1) / 2;
+
+    #pragma omp parallel
+    {
+        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+        #pragma omp for schedule(dynamic, 1)
+        for (int t = 0; t < ntiles; ++t) {
+            // Map linear lower-triangular tile index t -> (bi >= bj)
+            int bi = static_cast<int>((std::sqrt(8.0 * static_cast<double>(t) + 1.0) - 1.0) * 0.5);
+            while ((bi + 1) * (bi + 2) / 2 <= t) ++bi;
+            while (bi * (bi + 1) / 2 > t) --bi;
+            const int bj = t - bi * (bi + 1) / 2;
+
+            const int i0 = bi * NB;
+            const int j0 = bj * NB;
+            int tm = std::min(NB, n - i0);
+            int tn = std::min(NB, n - j0);
+            double *c_ptr = C + static_cast<size_t>(j0) * static_cast<size_t>(ldc) + i0;
+            const double *a_i = A + i0;
+            if (bi == bj) {
+#if GCTA_CPU_x86
+                dsyrk(&uplo, &notrans, &tm, &k, &alpha, a_i, &lda, &beta, c_ptr, &ldc);
+#else
+                dsyrk_(&uplo, &notrans, &tm, &k, &alpha, a_i, &lda, &beta, c_ptr, &ldc);
+#endif
+            } else {
+                const double *a_j = A + j0;
+#if GCTA_CPU_x86
+                dgemm(&notrans, &trans, &tm, &tn, &k, &alpha, a_i, &lda, a_j, &lda, &beta, c_ptr, &ldc);
+#else
+                dgemm_(&notrans, &trans, &tm, &tn, &k, &alpha, a_i, &lda, a_j, &lda, &beta, c_ptr, &ldc);
+#endif
+            }
+        }
+    }
+}
+
+// 2D cache-tiled OpenMP rectangular C += A * B^T using 1-thread dgemm per tile.
+// Caller must hold ScopedSingleThreadBLAS.
+static void parallelTiledGemmNT(int m, int n, int k, const double *A, int lda,
+                                const double *B, int ldb, double *C, int ldc) {
+    if (m <= 0 || n <= 0 || k <= 0) return;
+    char notrans = 'N', trans = 'T';
+    double alpha = 1.0, beta = 1.0;
+    const int nthreads = omp_get_max_threads();
+    if (nthreads <= 1 || static_cast<uint64_t>(m) * static_cast<uint64_t>(n) <= 256ULL * 256ULL) {
+#if GCTA_CPU_x86
+        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+        dgemm(&notrans, &trans, &m, &n, &k, &alpha, A, &lda, B, &ldb, &beta, C, &ldc);
+#else
+        dgemm_(&notrans, &trans, &m, &n, &k, &alpha, A, &lda, B, &ldb, &beta, C, &ldc);
+#endif
+        return;
+    }
+
+    const int NB = chooseGrmTileNB(static_cast<double>(m) * static_cast<double>(n), nthreads);
+    const int mb = (m + NB - 1) / NB;
+    const int nb = (n + NB - 1) / NB;
+    const int ntiles = mb * nb;
+
+    #pragma omp parallel
+    {
+        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+        #pragma omp for schedule(dynamic, 1)
+        for (int t = 0; t < ntiles; ++t) {
+            const int bj = t / mb;
+            const int bi = t % mb;
+            const int i0 = bi * NB;
+            const int j0 = bj * NB;
+            int tm = std::min(NB, m - i0);
+            int tn = std::min(NB, n - j0);
+            double *c_ptr = C + static_cast<size_t>(j0) * static_cast<size_t>(ldc) + i0;
+#if GCTA_CPU_x86
+            dgemm(&notrans, &trans, &tm, &tn, &k, &alpha, A + i0, &lda, B + j0, &ldb, &beta, c_ptr, &ldc);
+#else
+            dgemm_(&notrans, &trans, &tm, &tn, &k, &alpha, A + i0, &lda, B + j0, &ldb, &beta, c_ptr, &ldc);
+#endif
+        }
+    }
+}
+
+static inline uint32_t ctz_uptr(uintptr_t v) {
+#if defined(_MSC_VER)
+    unsigned long idx;
+#if defined(_WIN64)
+    _BitScanForward64(&idx, v);
+#else
+    _BitScanForward(&idx, v);
+#endif
+    return static_cast<uint32_t>(idx);
+#elif UINTPTR_MAX == UINT64_MAX
+    return static_cast<uint32_t>(__builtin_ctzll(v));
+#else
+    return static_cast<uint32_t>(__builtin_ctz(v));
+#endif
+}
+
+static inline uint64_t grmRowOffset(uint32_t row, uint32_t first_row) {
+    return (static_cast<uint64_t>(row) + 1ULL + static_cast<uint64_t>(first_row)) *
+           static_cast<uint64_t>(row - first_row) / 2ULL;
+}
+
+static inline int selectGRMBlockSize(uint64_t n_sample) {
+    if (n_sample <= 65536ULL) return 512;
+    if (n_sample <= 131072ULL) return 256;
+    return 128;
+}
+
+static inline void extractMissingIndicesFromPacked(const uintptr_t *packed, uint32_t n_sample, vector<uint32_t> &out_miss) {
+    out_miss.clear();
+    if (n_sample == 0) return;
+    const uint32_t kNypsPerWord = static_cast<uint32_t>(sizeof(uintptr_t) * 4);
+    const uintptr_t kMask55 = (~static_cast<uintptr_t>(0)) / 3;
+    const uint32_t n_words = (n_sample + kNypsPerWord - 1) / kNypsPerWord;
+    const uint32_t rem_samples = n_sample % kNypsPerWord;
+    const uintptr_t last_word_mask = (rem_samples == 0)
+                                         ? (~static_cast<uintptr_t>(0))
+                                         : ((static_cast<uintptr_t>(1) << (2 * rem_samples)) - 1);
+    for (uint32_t widx = 0; widx < n_words; ++widx) {
+        uintptr_t w = packed[widx];
+        if (widx + 1 == n_words) {
+            w &= last_word_mask;
+        }
+        uintptr_t miss_bits = (w & (w >> 1)) & kMask55;
+        while (miss_bits) {
+            const uint32_t bit_pos = ctz_uptr(miss_bits);
+            out_miss.push_back(widx * kNypsPerWord + (bit_pos >> 1));
+            miss_bits &= (miss_bits - 1);
+        }
+    }
+}
+
+} // namespace
+
 map<string, string> GRM::options;
 map<string, double> GRM::options_d;
 map<string, bool> GRM::options_b;
@@ -930,106 +1134,153 @@ uint32_t popcounts(uint64_t dw){
     return popcount(dw);
 }
 
+void GRM::flushDenseMissingBlock(){
+    if(denseMissCount == 0 || denseMissMask.empty()) return;
+    const int n_sample = static_cast<int>(part_keep_indices.second + 1);
+    denseNonZeroIdx.clear();
+    for(int idx = 0; idx < n_sample; ++idx){
+        if(denseMissMask[idx] != 0){
+            denseNonZeroIdx.push_back(idx);
+        }
+    }
+    if(!denseNonZeroIdx.empty()){
+        const int num_pairs = static_cast<int>(index_grm_pairs.size());
+        #pragma omp parallel for schedule(static)
+        for(int index = 0; index < num_pairs; index++){
+            auto index_pair = index_grm_pairs[index];
+            N_thread(index_pair.first, index_pair.second, denseMissMask.data());
+        }
+    }
+    std::fill(denseMissMask.begin(), denseMissMask.end(), 0);
+    denseMissCount = 0;
+}
+
 void GRM::calculate_GRM_blas(uintptr_t *buf, const vector<uint32_t> &markerIndex){
-    int num_marker = markerIndex.size();
+    const int num_marker = static_cast<int>(markerIndex.size());
+    const int m = static_cast<int>(part_keep_indices.second - part_keep_indices.first + 1);
+    const int n = static_cast<int>(part_keep_indices.second + 1);
+    const int n_sample = n;
+    const int s_n = n - m;
+    const size_t n_sample_sz = static_cast<size_t>(n_sample);
 
-    static int m = part_keep_indices.second - part_keep_indices.first + 1;
-    static int n = part_keep_indices.second + 1;
-    static int n_sample = n;
-    static int s_n = n - m;
-    static int bytesStdGeno = sizeof(double) * n_sample;
-
-   // GenoBufItem items[num_marker];
- 
-    #pragma omp parallel for
-    for(int i = 0; i < num_marker; i++){
-        GenoBufItem &item = gbufitems[i];
-        item.extractedMarkerIndex = markerIndex[i];
-        geno->getGenoDouble(buf, i, &item);
+    ScopedSingleThreadBLAS blas_guard;
+    #pragma omp parallel
+    {
+        ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+        #pragma omp for schedule(static)
+        for(int i = 0; i < num_marker; i++){
+            GenoBufItem &item = gbufitems[i];
+            item.extractedMarkerIndex = markerIndex[i];
+            item.extGenoOut = stdGeno + static_cast<size_t>(i) * n_sample_sz;
+            item.maxOutSampleCT = static_cast<uint32_t>(n_sample);
+            item.skipDenseMissing = true;
+            item.hasMissOut = false;
+            item.packedGenoVec = NULL;
+            geno->getGenoDouble(buf, i, &item);
+            if(item.valid && item.hasMissOut){
+                if(item.packedGenoVec != NULL){
+                    extractMissingIndicesFromPacked(item.packedGenoVec, static_cast<uint32_t>(n_sample), item.bgenMissIndex);
+                }else{
+                    while(!item.bgenMissIndex.empty() && item.bgenMissIndex.back() >= static_cast<uint32_t>(n_sample)){
+                        item.bgenMissIndex.pop_back();
+                    }
+                }
+                item.hasMissOut = !item.bgenMissIndex.empty();
+            }
+        }
     }
 
-    vector<int> validIndex;
-    validIndex.reserve(num_marker);
+    validIndexBuf.clear();
+    sparseMissMarkers.clear();
+    const size_t sparseThresh = std::max<size_t>(64, n_sample_sz / 8);
+    const int maxDenseBits = static_cast<int>(sizeof(uintptr_t) * CHAR_BIT);
+
     for(int i = 0; i < num_marker; i++){
         if(gbufitems[i].valid){
-            validIndex.push_back(i);
+            validIndexBuf.push_back(i);
+            sd.push_back(gbufitems[i].sd);
         }
     }
 
-    int curNumValidMarkers = validIndex.size();
-
-    for(int i = 0; i < curNumValidMarkers; i++){
-        int curIndex = validIndex[i];
-        memcpy(stdGeno + i * n_sample, gbufitems[curIndex].geno.data(), bytesStdGeno);
-        sd.push_back(gbufitems[curIndex].sd);
-        /*
-        if(gbufitems[i].missing[41/64] & (1UL << (41 %64))){
-        */
+    int curNumValidMarkers = static_cast<int>(validIndexBuf.size());
+    if(curNumValidMarkers == 0){
+        finished_marker += num_marker;
+        return;
     }
 
-    static char notrans='N', trans='T';
-    static double alpha = 1.0, beta = 1.0;
-    static char uplo='L';
-   // A * At 
+    if(curNumValidMarkers < num_marker){
+        for(int dst = 0; dst < curNumValidMarkers; dst++){
+            int src = validIndexBuf[dst];
+            if(dst != src){
+                memcpy(stdGeno + static_cast<size_t>(dst) * n_sample_sz,
+                       stdGeno + static_cast<size_t>(src) * n_sample_sz,
+                       n_sample_sz * sizeof(double));
+            }
+        }
+    }
+
+    // A * At via 2D cache-tiled OpenMP + 1T BLAS kernels
     if(part_keep_indices.first == 0){
-#if GCTA_CPU_x86
-        dsyrk(&uplo, &notrans, &n, &curNumValidMarkers, &alpha, stdGeno, &n_sample, &beta, grm, &m);
-#else
-        dsyrk_(&uplo, &notrans, &n, &curNumValidMarkers, &alpha, stdGeno, &n_sample, &beta, grm, &m);
-#endif
+        parallelTiledSyrkLower(n, curNumValidMarkers, stdGeno, n_sample, grm, m);
     }else{
-        //dgemm(&notrans, &trans, &m, &n, &num_marker, &alpha, stdGeno + part_keep_indices.first, &n_sample, stdGeno, &n_sample, &beta, grm, &m);
-#if GCTA_CPU_x86
-        dgemm(&notrans, &trans, &m, &s_n, &curNumValidMarkers, &alpha, stdGeno + part_keep_indices.first, &n_sample, stdGeno, &n_sample, &beta, grm, &m);
-#else
-        dgemm_(&notrans, &trans, &m, &s_n, &curNumValidMarkers, &alpha, stdGeno + part_keep_indices.first, &n_sample, stdGeno, &n_sample, &beta, grm, &m);
-#endif
+        parallelTiledGemmNT(m, s_n, curNumValidMarkers, stdGeno + part_keep_indices.first, n_sample, stdGeno, n_sample, grm, m);
         double * grm_start = grm + ((uint64_t)s_n) * m;
-#if GCTA_CPU_x86
-        dsyrk(&uplo, &notrans, &m, &curNumValidMarkers, &alpha, stdGeno + part_keep_indices.first, &n_sample, &beta, grm_start, &m); 
-#else
-        dsyrk_(&uplo, &notrans, &m, &curNumValidMarkers, &alpha, stdGeno + part_keep_indices.first, &n_sample, &beta, grm_start, &m); 
-#endif
+        parallelTiledSyrkLower(m, curNumValidMarkers, stdGeno + part_keep_indices.first, n_sample, grm_start, m);
     }
 
-    //memset(this->cmask_buf, 0, num_byte_cmask);
-
-    //LOGGER << "count N" << std::endl;
-    const int markerPerN = sizeof(uintptr_t) * CHAR_BIT;
-    int numNblock = (curNumValidMarkers + markerPerN - 1) / markerPerN;
-    static int numNSampleBlock = (n + markerPerN - 1) / markerPerN;
-    //LOGGER << "marker block: " << numNblock << ", sample block:" << numNSampleBlock << ", MarkerPerN: " << markerPerN << std::endl;
-    //LOGGER << ", n: " << n << std::endl;
-    uintptr_t *sample_miss = new uintptr_t[numNSampleBlock * markerPerN]; // don't need to set to 0
-    for(int i = 0; i < numNblock; i++){
-        int lastIndex = markerPerN * (i + 1);
-        int lastValidIndex = lastIndex > curNumValidMarkers ? curNumValidMarkers : lastIndex;
-
-        int baseMarkerIndex = markerPerN * i;
-        #pragma omp parallel for
-        for(int j = 0; j < numNSampleBlock; j++){
-            int baseMissIndex = j * markerPerN;
-            for(int k = baseMarkerIndex; k < lastValidIndex; k++){
-                int curMarkerIndex = validIndex[k];
-                sample_miss[baseMissIndex + k - baseMarkerIndex] = revbits(gbufitems[curMarkerIndex].missing[j]);
-            }
-            for(int k = lastValidIndex; k < lastIndex; k++){
-                sample_miss[baseMissIndex + k - baseMarkerIndex] = 0UL;
-            }
-            
-            flip64(&sample_miss[baseMissIndex]);
-
-            for(int k = baseMissIndex; k < baseMissIndex + markerPerN; k++){
-                sub_miss[k] += popcounts(sample_miss[k]); // give sub_miss a little more avoid overflow
-            }
+    for(int k = 0; k < curNumValidMarkers; k++){
+        const int src = validIndexBuf[k];
+        if(!gbufitems[src].hasMissOut) continue;
+        const vector<uint32_t> &miss = gbufitems[src].bgenMissIndex;
+        const size_t miss_ct = miss.size();
+        for(size_t u = 0; u < miss_ct; ++u){
+            sub_miss[miss[u]] += 1;
         }
-        #pragma omp parallel for
-        for(int index = 0; index < index_grm_pairs.size(); index++){
-            auto index_pair = index_grm_pairs[index];
-            N_thread(index_pair.first, index_pair.second, sample_miss);
+        if(miss.back() < part_keep_indices.first){
+            continue;
+        }
+        if(miss_ct <= sparseThresh){
+            sparseMissMarkers.push_back(src);
+        }else{
+            if(denseMissMask.size() < n_sample_sz){
+                denseMissMask.assign(n_sample_sz, 0);
+            }
+            const uintptr_t bit = static_cast<uintptr_t>(1) << denseMissCount;
+            for(size_t u = 0; u < miss_ct; ++u){
+                denseMissMask[miss[u]] |= bit;
+            }
+            denseMissCount++;
+            if(denseMissCount == maxDenseBits){
+                flushDenseMissingBlock();
+            }
         }
     }
-    delete[] sample_miss;
+
+    if(!sparseMissMarkers.empty()){
+        const uint32_t first_row = part_keep_indices.first;
+        const int num_pairs = static_cast<int>(index_grm_pairs.size());
+        const size_t n_sparse = sparseMissMarkers.size();
+        #pragma omp parallel for schedule(static)
+        for(int t = 0; t < num_pairs; ++t){
+            const uint32_t r_from = static_cast<uint32_t>(index_grm_pairs[t].first);
+            const uint32_t r_to = static_cast<uint32_t>(index_grm_pairs[t].second);
+            for(size_t s = 0; s < n_sparse; ++s){
+                const vector<uint32_t> &miss = gbufitems[sparseMissMarkers[s]].bgenMissIndex;
+                if(miss.back() < r_from || miss.front() > r_to) continue;
+                const size_t a_lo = static_cast<size_t>(
+                    std::lower_bound(miss.begin(), miss.end(), r_from) - miss.begin());
+                const size_t a_hi = static_cast<size_t>(
+                    std::upper_bound(miss.begin() + a_lo, miss.end(), r_to) - miss.begin());
+                for(size_t a = a_lo; a < a_hi; ++a){
+                    const uint32_t row_i = miss[a];
+                    uint32_t *row_N = N + grmRowOffset(row_i, first_row);
+                    for(size_t b = 0; b <= a; ++b){
+                        row_N[miss[b]] += 1;
+                    }
+                }
+            }
+        }
+    }
 
     finished_marker += num_marker;
 
@@ -1354,6 +1605,8 @@ bool write_GRM(float *grm, float *N, FILE *grm_out, FILE *N_out, uint32_t row_in
 
 
 void GRM::deduce_GRM(){
+    flushDenseMissingBlock();
+
     LOGGER.i(0, "The GRM computation is completed.");
     float thresh = -99;
     bool isSparse = false;
@@ -1388,128 +1641,121 @@ void GRM::deduce_GRM(){
             LOGGER.e(0, "can't open " + o_name + ".grm.bin or .grm.N.bin to write");
         }
     }
+    if(grm_out) setvbuf(grm_out, NULL, _IOFBF, 4 * 1024 * 1024);
+    if(N_out) setvbuf(N_out, NULL, _IOFBF, 4 * 1024 * 1024);
 
     float mtd_weight = 1.0;
     if(options_b["isMtd"]){
         float weight = 0;
         if(!isDominance){
-            for(int i = 0; i < numValidMarkers; i++){
-                //float af = geno->AFA1[i];
-                //float sd = 2.0 * af * (1.0 - af); 
+            for(uint32_t i = 0; i < numValidMarkers; i++){
                 weight += sd[i];
             }
         }else{
-            for(int i = 0; i < numValidMarkers; i++){
-                //float af = geno->AFA1[i];
-                //float sd = 2.0 * af * (1.0 - af); 
+            for(uint32_t i = 0; i < numValidMarkers; i++){
                 weight += sd[i] * sd[i];
             }
         }
         mtd_weight = 1.0 / (weight / numValidMarkers);
     }
 
- 
-    /* X chr adjustment
-    float weights[5];
-    weights[2] = 0.5 * mtd_weight; // male male
-    weights[3] = sqrt(0.5) * mtd_weight; // male female;
-    weights[4] = 1.0 * mtd_weight; // female female;
-    // don't need now.
-    */
+    const uint32_t first_row = part_keep_indices.first;
+    const uint32_t last_row = part_keep_indices.second;
+    const uint64_t m = static_cast<uint64_t>(last_row - first_row + 1);
+    const uint32_t kStripeRows = 64;
+    const uint32_t kTileCols = 64;
+    const size_t max_stripe_elems = static_cast<size_t>(kStripeRows) * static_cast<size_t>(last_row + 1);
 
-    uint32_t num_sample = index_keep.size();
-    float *w_grm = new float[num_sample];
-    float *w_N = new float[num_sample];
+    vector<float> w_grm_stripe(max_stripe_elems);
+    vector<float> w_N_stripe(isSparse ? 0 : max_stripe_elems);
+    vector<string> sparse_row_strings(isSparse ? kStripeRows : 0);
 
-    double *po_grm = grm;
-    uint32_t *po_N = N;
-
-    uint64_t m = part_keep_indices.second - part_keep_indices.first + 1;
-    //LOGGER << "mtd weight: " << mtd_weight << std::endl;
-   
-    /*
-    std::ofstream osub("test1.txt");
-    for(int i = 0; i < part_keep_indices.second + 1; i++){
-        osub << sub_miss[i] << std::endl;
-    }
-    osub.close();
-    */
-    
     if(bBLAS){
-        for(int pair1 = part_keep_indices.first; pair1 != part_keep_indices.second + 1; pair1++){
-            uint32_t sub_miss1 = numValidMarkers - sub_miss[pair1];
-            for(int pair2 = 0; pair2 != pair1 + 1; pair2++){
-                uint32_t sub_N = *(po_N + pair2) + sub_miss1 - sub_miss[pair2];
-                w_N[pair2] = (float)sub_N;
+        size_t row_out_off[kStripeRows + 1];
+        uint64_t row_N_off[kStripeRows];
+        uint32_t row_sub_miss1[kStripeRows];
 
-                if(sub_N){
-                    w_grm[pair2] = (float)((*(po_grm + (uint64_t)pair2 * m))/sub_N) * mtd_weight;
-                }else{
-                    w_grm[pair2] = 0.0;
-                }
-                //po_N++;
-                //po_grm++;
+        for(uint64_t r0 = 0; r0 < m; r0 += kStripeRows){
+            const uint32_t r_cnt = static_cast<uint32_t>(std::min<uint64_t>(kStripeRows, m - r0));
+            row_out_off[0] = 0;
+            for(uint32_t dr = 0; dr < r_cnt; ++dr){
+                const uint32_t pair1 = first_row + static_cast<uint32_t>(r0) + dr;
+                row_out_off[dr + 1] = row_out_off[dr] + static_cast<size_t>(pair1 + 1);
+                row_N_off[dr] = grmRowOffset(pair1, first_row);
+                row_sub_miss1[dr] = numValidMarkers - sub_miss[pair1];
             }
-            //fwrite(w_grm, sizeof(float), pair1 + 1, grm_out);
-            //fwrite(w_N, sizeof(float), pair1 + 1, N_out);
-            write_GRM(w_grm, w_N, grm_out, N_out, pair1, thresh);
-            po_N = po_N + pair1 + 1;
-            po_grm = po_grm + 1;
+            const size_t stripe_elems = row_out_off[r_cnt];
+            const uint32_t max_col = first_row + static_cast<uint32_t>(r0) + r_cnt;
+            const int n_col_tiles = static_cast<int>((max_col + kTileCols - 1) / kTileCols);
+
+            #pragma omp parallel for schedule(static)
+            for(int tc = 0; tc < n_col_tiles; ++tc){
+                const uint32_t c0 = static_cast<uint32_t>(tc) * kTileCols;
+                const uint32_t c_cnt = std::min<uint32_t>(kTileCols, max_col - c0);
+                double tile[kStripeRows][kTileCols];
+
+                for(uint32_t dc = 0; dc < c_cnt; ++dc){
+                    const double *col_ptr = grm + static_cast<uint64_t>(c0 + dc) * m + r0;
+                    for(uint32_t dr = 0; dr < r_cnt; ++dr){
+                        tile[dr][dc] = col_ptr[dr];
+                    }
+                }
+
+                for(uint32_t dr = 0; dr < r_cnt; ++dr){
+                    const uint32_t pair1 = first_row + static_cast<uint32_t>(r0) + dr;
+                    if(c0 > pair1) continue;
+                    const uint32_t dc_end = std::min<uint32_t>(c_cnt, pair1 - c0 + 1);
+                    const uint32_t sub_miss1 = row_sub_miss1[dr];
+                    const uint32_t *po_N_row = N + row_N_off[dr] + c0;
+                    float *out_grm_row = w_grm_stripe.data() + row_out_off[dr] + c0;
+                    if(!isSparse){
+                        float *out_N_row = w_N_stripe.data() + row_out_off[dr] + c0;
+                        for(uint32_t dc = 0; dc < dc_end; ++dc){
+                            const uint32_t sub_N = po_N_row[dc] + sub_miss1 - sub_miss[c0 + dc];
+                            out_N_row[dc] = static_cast<float>(sub_N);
+                            out_grm_row[dc] = sub_N ? (static_cast<float>(tile[dr][dc] / sub_N) * mtd_weight) : 0.0f;
+                        }
+                    }else{
+                        for(uint32_t dc = 0; dc < dc_end; ++dc){
+                            const uint32_t sub_N = po_N_row[dc] + sub_miss1 - sub_miss[c0 + dc];
+                            out_grm_row[dc] = sub_N ? (static_cast<float>(tile[dr][dc] / sub_N) * mtd_weight) : 0.0f;
+                        }
+                    }
+                }
+            }
+
+            if(!isSparse){
+                if(fwrite(w_grm_stripe.data(), sizeof(float), stripe_elems, grm_out) != stripe_elems ||
+                   fwrite(w_N_stripe.data(), sizeof(float), stripe_elems, N_out) != stripe_elems){
+                    LOGGER.e(0, "Failed to write GRM binary output to [" + o_name + ".grm.bin/.grm.N.bin]");
+                }
+            }else{
+                #pragma omp parallel for schedule(static)
+                for(int dr = 0; dr < static_cast<int>(r_cnt); ++dr){
+                    const uint32_t pair1 = first_row + static_cast<uint32_t>(r0) + static_cast<uint32_t>(dr);
+                    const float *row_vals = w_grm_stripe.data() + row_out_off[dr];
+                    std::ostringstream ss;
+                    ss << std::setprecision(std::numeric_limits<float>::digits10 + 2);
+                    for(uint32_t pair2 = 0; pair2 <= pair1; ++pair2){
+                        const float tmp_grm = row_vals[pair2];
+                        if(tmp_grm >= thresh){
+                            ss << pair1 << "\t" << pair2 << "\t" << tmp_grm << "\n";
+                        }
+                    }
+                    sparse_row_strings[dr] = ss.str();
+                }
+                for(uint32_t dr = 0; dr < r_cnt; ++dr){
+                    const string &s = sparse_row_strings[dr];
+                    if(!s.empty()){
+                        fwrite(s.data(), 1, s.size(), grm_out);
+                    }
+                }
+            }
         }
     }
-    /* // don't need special case
-    else{
-        if(!options_b["xchr"]){
-            for(int pair1 = part_keep_indices.first; pair1 != part_keep_indices.second + 1; pair1++){
-                uint32_t sub_miss1 = finished_marker - sub_miss[pair1];
-                for(int pair2 = 0; pair2 != pair1 + 1; pair2++){
-                    uint32_t sub_N = *po_N + sub_miss1 - sub_miss[pair2];
-                    w_N[pair2] = (float)sub_N;
-
-                    if(sub_N){
-                        w_grm[pair2] = (float)((*po_grm)/sub_N) * mtd_weight;
-                    }else{
-                        w_grm[pair2] = 0.0;
-                    }
-                    po_N++;
-                    po_grm++;
-                }
-                //fwrite(w_grm, sizeof(float), pair1 + 1, grm_out);
-                //fwrite(w_N, sizeof(float), pair1 + 1, N_out);
-                write_GRM(w_grm, w_N, grm_out, N_out, pair1, thresh);
-            }
-        }else{
-            for(uint32_t pair1 = part_keep_indices.first; pair1 != part_keep_indices.second + 1; pair1++){
-                uint32_t sub_miss1 = finished_marker - sub_miss[pair1];
-                int8_t weight1 = pheno->get_sex(pair1);
-                for(uint32_t pair2 = 0; pair2 != pair1 + 1; pair2++){
-                    uint32_t sub_N = *po_N + sub_miss1 - sub_miss[pair2];
-                    w_N[pair2] = (float)sub_N;
-
-                    if(sub_N){
-                        int8_t weight2 = weight1 + pheno->get_sex(pair2);
-                        w_grm[pair2] = weights[weight2] * ((*po_grm) /sub_N);
-
-                    }else{
-                        w_grm[pair2] = 0.0;
-                    }
-                    po_N++;
-                    po_grm++;
-                }
-                //fwrite(w_grm, sizeof(float), pair1 + 1, grm_out);
-                //fwrite(w_N, sizeof(float), pair1 + 1, N_out);
-                write_GRM(w_grm, w_N, grm_out, N_out, pair1, thresh);
-            }
-        }
-    }
-    */
-
 
     if(grm_out)fclose(grm_out);
     if(N_out)fclose(N_out);
-    delete[] w_grm;
-    delete[] w_N;
-    //t_print(begin, "  GRM deduce finished");
     if(!isSparse){
         LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.bin]");
         LOGGER.i(0, "Number of SNPs in each pair of individuals has been saved in the file [" + o_name + ".grm.N.bin]");
@@ -1521,12 +1767,31 @@ void GRM::deduce_GRM(){
 
 
 void GRM::N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cmask){
-    uint64_t startPos = ((uint64_t)grm_index_from + 1 + part_keep_indices.first) * (grm_index_from - part_keep_indices.first) / 2;
+    uint64_t startPos = grmRowOffset(static_cast<uint32_t>(grm_index_from), part_keep_indices.first);
+    uint32_t *po_N = N + startPos;
+    if(!denseNonZeroIdx.empty()){
+        const size_t nz_total = denseNonZeroIdx.size();
+        size_t nz_end = static_cast<size_t>(
+            std::upper_bound(denseNonZeroIdx.begin(), denseNonZeroIdx.end(), grm_index_from) - denseNonZeroIdx.begin());
+        for(int index_pair1 = grm_index_from; index_pair1 <= grm_index_to; index_pair1++){
+            while(nz_end < nz_total && denseNonZeroIdx[nz_end] <= index_pair1){
+                nz_end++;
+            }
+            const uintptr_t cmask1 = cur_cmask[index_pair1];
+            if(cmask1){
+                for(size_t u = 0; u < nz_end; ++u){
+                    const int index_pair2 = denseNonZeroIdx[u];
+                    const uintptr_t cmask = cmask1 & cur_cmask[index_pair2];
+                    if(cmask){
+                        po_N[index_pair2] += popcounts(cmask);
+                    }
+                }
+            }
+            po_N += index_pair1 + 1;
+        }
+        return;
+    }
 
-    uint32_t *po_N_start = N + startPos;
-    //for(int cur_block = 0; cur_block != Constants::NUM_MARKER_READ / num_cmask_block; cur_block++){
-    //uint64_t *cur_cmask = cmask_buf + cur_block * index_keep.size();
-    uint32_t *po_N = po_N_start;
     const uintptr_t *p_cmask1 = cur_cmask + grm_index_from;
     for(int index_pair1 = grm_index_from; index_pair1 != grm_index_to + 1; index_pair1++){
         const uintptr_t *p_cmask2 = cur_cmask;
@@ -1546,7 +1811,6 @@ void GRM::N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cm
             po_N += index_pair1 + 1;
         }
     }
-    //}
 }
 
 void GRM::grm_thread(int grm_index_from, int grm_index_to) {
@@ -1965,18 +2229,13 @@ int GRM::registerOption(map<string, vector<string>>& options_in) {
 }
 
 void GRM::processMakeGRM(){
-    nMarkerBlock = 128;
+    const uint64_t n_sample_out = static_cast<uint64_t>(part_keep_indices.second) + 1ULL;
+    nMarkerBlock = selectGRMBlockSize(n_sample_out);
     gbufitems = new GenoBufItem[nMarkerBlock];
-    /*
-    uint32_t sampleCT, missPtrSize; 
-    geno->setGenoItemSize(sampleCT, missPtrSize);
-    for(int i = 0; i < nMarkerBlock; i++){
-        gbufitems[i].geno.resize(sampleCT);
-        gbufitems[i].missing.resize(missPtrSize);
-    }
-    */
-    this->num_byte_geno = sizeof(double) * nMarkerBlock * (part_keep_indices.second + 1);
-    int ret = posix_memalign((void **)&stdGeno, 32, num_byte_geno);
+    validIndexBuf.reserve(nMarkerBlock);
+    sparseMissMarkers.reserve(nMarkerBlock);
+    this->num_byte_geno = sizeof(double) * static_cast<uint64_t>(nMarkerBlock) * n_sample_out;
+    int ret = posix_memalign((void **)&stdGeno, 64, num_byte_geno);
     if(ret != 0){
         LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");
     }
@@ -1989,6 +2248,7 @@ void GRM::processMakeGRM(){
         LOGGER.e(0, "the original version has been deleted. Please use GCTA >= 1.92.4");
     }
     geno->setGRMMode(true, isDominance);
+    geno->setOutSampleLimit(static_cast<uint32_t>(n_sample_out));
     bool isSTD = true;
     if(isMtd) isSTD = false;
     vector<uint32_t> processIndex = marker->get_extract_index_autosome();
@@ -1998,23 +2258,20 @@ void GRM::processMakeGRM(){
     LOGGER << "  Used " << numValidMarkers << " valid SNPs."<< std::endl;
     deduce_GRM();
     delete[] gbufitems;
+    gbufitems = NULL;
     posix_mem_free(stdGeno);
+    stdGeno = NULL;
     geno->setGRMMode(false, false);
 }
 
 void GRM::processMakeGRMX(){
-    nMarkerBlock = 128;
+    const uint64_t n_sample_out = static_cast<uint64_t>(part_keep_indices.second) + 1ULL;
+    nMarkerBlock = selectGRMBlockSize(n_sample_out);
     gbufitems = new GenoBufItem[nMarkerBlock];
-    /*
-    uint32_t sampleCT, missPtrSize; 
-    geno->setGenoItemSize(sampleCT, missPtrSize);
-    for(int i = 0; i < nMarkerBlock; i++){
-        gbufitems[i].geno.resize(sampleCT);
-        gbufitems[i].missing.resize(missPtrSize);
-    }
-    */
-    this->num_byte_geno = sizeof(double) * nMarkerBlock * (part_keep_indices.second + 1);
-    int ret = posix_memalign((void **)&stdGeno, 32, num_byte_geno);
+    validIndexBuf.reserve(nMarkerBlock);
+    sparseMissMarkers.reserve(nMarkerBlock);
+    this->num_byte_geno = sizeof(double) * static_cast<uint64_t>(nMarkerBlock) * n_sample_out;
+    int ret = posix_memalign((void **)&stdGeno, 64, num_byte_geno);
     if(ret != 0){
         LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");
     }
@@ -2027,6 +2284,7 @@ void GRM::processMakeGRMX(){
         LOGGER.e(0, "the original version has been deleted. Please use GCTA >= 1.92.4");
     }
     geno->setGRMMode(true, isDominance);
+    geno->setOutSampleLimit(static_cast<uint32_t>(n_sample_out));
     bool isSTD = true;
     if(isMtd) isSTD = false;
     vector<uint32_t> processIndex = marker->get_extract_index_X();
@@ -2036,7 +2294,9 @@ void GRM::processMakeGRMX(){
     LOGGER << numValidMarkers << " valid SNPs are included."<< std::endl;
     deduce_GRM();
     delete[] gbufitems;
+    gbufitems = NULL;
     posix_mem_free(stdGeno);
+    stdGeno = NULL;
     geno->setGRMMode(false, false);
 
 }

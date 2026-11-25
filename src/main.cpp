@@ -16,6 +16,7 @@
  * A copy of the GNU General Public License is attached along with this program.
  * If not, see <http://www.gnu.org/licenses/>.
 */
+#include "cpu_f77blas.h"
 #include <iostream>
 #include "Logger.h"
 #include "Geno.h"
@@ -48,6 +49,10 @@ using std::function;
 using std::placeholders::_1;
 using std::placeholders::_2;
 using std::placeholders::_3;
+
+#if GCTA_CPU_ARM || defined(OPENBLAS_CONST)
+extern "C" void openblas_set_num_threads(int num_threads);
+#endif
 
 void out_ver(bool flag_outFile){
     function<void (int, const string&, const string&)> log;
@@ -233,6 +238,11 @@ int main(int argc, char *argv[]){
         #error Only Windows, Mac and Linux are supported.
     #endif
     omp_set_num_threads(thread_num);
+#if GCTA_CPU_x86
+    mkl_set_num_threads(thread_num);
+#elif GCTA_CPU_ARM || defined(OPENBLAS_CONST)
+    openblas_set_num_threads(thread_num);
+#endif
 
 
     // end thread;

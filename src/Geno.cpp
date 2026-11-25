@@ -681,6 +681,15 @@ void Geno::preGenoDouble_bed(){
     keepMaskInterPtr = new uintptr_t[maskPtrSize];
     PgenReader::SetSampleSubsets(sampleKeepIndex, raw_sample_ct, keepMaskPtr, keepMaskInterPtr);
 
+    outKeepMaskPtr = NULL;
+    if(outSampleCTLimit > 0 && outSampleCTLimit < keepSampleCT && raw_sample_ct != keepSampleCT){
+        vector<uint32_t> prefixKeepIndex(sampleKeepIndex.begin(), sampleKeepIndex.begin() + outSampleCTLimit);
+        outKeepMaskPtr = new uintptr_t[maskPtrSize];
+        uintptr_t *tmpInterPtr = new uintptr_t[maskPtrSize];
+        PgenReader::SetSampleSubsets(prefixKeepIndex, raw_sample_ct, outKeepMaskPtr, tmpInterPtr);
+        delete[] tmpInterPtr;
+    }
+
     sexMaskPtr = new uintptr_t[maskPtrSize];
     sexMaskInterPtr = new uintptr_t[maskPtrSize];
     PgenReader::SetSampleSubsets(keepSexIndex, raw_sample_ct, sexMaskPtr, sexMaskInterPtr);
@@ -861,8 +870,9 @@ bool Geno::inspectPackedBedSNP(uintptr_t *buf, int idx, GenoBufItem *gbuf, Packe
         double rdev = bGenoStd ? sqrt(1.0 / sd) : 1.0;
         double aa0 = 0.0, aa2 = 2.0;
         if(isEffRev){
+            double temp = aa0;
             aa0 = aa2;
-            aa2 = aa0;
+            aa2 = temp;
         }
         packed->a0 = (aa0 - center_value) * rdev;
         packed->a1 = (1.0 - center_value) * rdev;
@@ -1022,7 +1032,7 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     if(isEffRev){
                         double temp = aa0;
                         aa0 = aa2;
-                        aa2 = aa0;
+                        aa2 = temp;
                     }
 
                     a0 = (aa0 - center_value) * rdev;
@@ -1048,21 +1058,56 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                 }
 
                 const double lookup[32] __attribute__ ((aligned (16))) = GET_TABLE16(a0, a1, a2, na);
-                gbuf->geno.resize(keepSampleCT);
-                uintptr_t * pmiss = NULL;
-                if(bMakeMiss){
-                    gbuf->missing.resize(missPtrSize); 
-                    pmiss = gbuf->missing.data();
+                const uint32_t outSampleCT = (gbuf->maxOutSampleCT > 0 && gbuf->maxOutSampleCT < keepSampleCT)
+                                                 ? gbuf->maxOutSampleCT
+                                                 : keepSampleCT;
+                double *genoOut = gbuf->extGenoOut;
+                if(genoOut == NULL){
+                    gbuf->geno.resize(outSampleCT);
+                    genoOut = gbuf->geno.data();
                 }
-                uintptr_t *subsetScratch = NULL;
+
+                const uintptr_t *activeBufPtr = cur_buf;
                 if(rawSampleCT != keepSampleCT){
-                    const size_t subsetWords = static_cast<size_t>(PgenReader::GetGenoBufPtrSize(keepSampleCT));
+                    const size_t subsetWords = static_cast<size_t>(PgenReader::GetGenoBufPtrSize(outSampleCT));
                     if(gbuf->subsetBuf.size() < subsetWords){
                         gbuf->subsetBuf.resize(subsetWords);
                     }
-                    subsetScratch = gbuf->subsetBuf.data();
+                    uintptr_t *subsetScratch = gbuf->subsetBuf.data();
+                    const uintptr_t *activeMaskPtr = (outSampleCT < keepSampleCT && outKeepMaskPtr != NULL)
+                                                         ? outKeepMaskPtr
+                                                         : keepMaskPtr;
+                    PgenReader::ExtractGenoExt(cur_buf, activeMaskPtr, rawSampleCT, outSampleCT, subsetScratch);
+                    activeBufPtr = subsetScratch;
                 }
-                PgenReader::ExtractDoubleExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, lookup, gbuf->geno.data(), pmiss, subsetScratch); 
+                plink2::GenoarrLookup16x8bx2(activeBufPtr, lookup, outSampleCT, genoOut);
+
+                if(bMakeMiss){
+                    const uint32_t totalMissKeep = keepSampleCT - snpinfo.N;
+                    if(gbuf->skipDenseMissing){
+                        gbuf->hasMissOut = (totalMissKeep > 0);
+                        gbuf->packedGenoVec = (totalMissKeep > 0) ? activeBufPtr : NULL;
+                    }else{
+                        gbuf->missing.resize(missPtrSize);
+                        if(totalMissKeep == 0){
+                            std::fill(gbuf->missing.begin(), gbuf->missing.end(), 0);
+                        }else if(outSampleCT == keepSampleCT){
+                            plink2::GenoarrToMissingnessUnsafe(activeBufPtr, keepSampleCT, gbuf->missing.data());
+                        }else{
+                            const size_t fullWords = static_cast<size_t>(PgenReader::GetGenoBufPtrSize(keepSampleCT));
+                            if(gbuf->subsetBuf.size() < fullWords){
+                                gbuf->subsetBuf.resize(fullWords);
+                            }
+                            uintptr_t *fullScratch = gbuf->subsetBuf.data();
+                            const uintptr_t *fullPtr = cur_buf;
+                            if(rawSampleCT != keepSampleCT){
+                                PgenReader::ExtractGenoExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, fullScratch);
+                                fullPtr = fullScratch;
+                            }
+                            plink2::GenoarrToMissingnessUnsafe(fullPtr, keepSampleCT, gbuf->missing.data());
+                        }
+                    }
+                }
                 // adjust for chr X;
                 if(isSexXY == 1){
                     /* don't set to missing
@@ -1080,20 +1125,40 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     setMaleWeight(weight, needWeight);
                     if(needWeight){
                         if(bGRM){
-                            for(int i = 0 ; i < keepMaleSampleCT; i++){
-                                gbuf->geno[keepMaleExtractIndex[i]] *= weight;
+                            for(uint32_t i = 0 ; i < keepMaleSampleCT; i++){
+                                uint32_t curIndex = keepMaleExtractIndex[i];
+                                if(curIndex >= outSampleCT) break;
+                                genoOut[curIndex] *= weight;
                             }
                         }else{
                             double correctWeight = (weight - 1) * rdev * center_value;
-                            for(int i = 0 ; i < keepMaleSampleCT; i++){
+                            for(uint32_t i = 0 ; i < keepMaleSampleCT; i++){
                                 uint32_t curIndex = keepMaleExtractIndex[i];
-                                gbuf->geno[curIndex] *= weight;
-                                gbuf->geno[curIndex] += correctWeight;
+                                if(curIndex >= outSampleCT) break;
+                                genoOut[curIndex] *= weight;
+                                genoOut[curIndex] += correctWeight;
                             }
                         }
                     }
 
                     
+                }
+            } else if(bMakeMiss){
+                const uint32_t totalMissKeep = keepSampleCT - snpinfo.N;
+                gbuf->missing.resize(missPtrSize);
+                if(totalMissKeep == 0){
+                    std::fill(gbuf->missing.begin(), gbuf->missing.end(), 0);
+                }else{
+                    const uintptr_t *fullPtr = cur_buf;
+                    if(rawSampleCT != keepSampleCT){
+                        const size_t fullWords = static_cast<size_t>(PgenReader::GetGenoBufPtrSize(keepSampleCT));
+                        if(gbuf->subsetBuf.size() < fullWords){
+                            gbuf->subsetBuf.resize(fullWords);
+                        }
+                        PgenReader::ExtractGenoExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, gbuf->subsetBuf.data());
+                        fullPtr = gbuf->subsetBuf.data();
+                    }
+                    plink2::GenoarrToMissingnessUnsafe(fullPtr, keepSampleCT, gbuf->missing.data());
                 }
             }
             return;
@@ -1332,7 +1397,7 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
         uint32_t sindex = (*curSampleIndexPtr)[j];
         uint8_t item_ploidy = sample_ploidy[sindex];
         if(item_ploidy > 128){
-            miss_index.push_back(sindex);
+            miss_index.push_back(static_cast<uint32_t>(j));
             has_miss = true;
             dosages[j] = max_dos;
         }else if(item_ploidy == 2){
@@ -1506,9 +1571,16 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     dos_lookup[max_dos] = (dosna - center_value) * rdev;
                 }
 
-                gbuf->geno.resize(curSampleCT);
-                for(int j = 0; j < curSampleCT; j++){
-                    gbuf->geno[j] = dos_lookup[dosages[j]];
+                const uint32_t outSampleCT = (gbuf->maxOutSampleCT > 0 && gbuf->maxOutSampleCT < curSampleCT)
+                                                 ? gbuf->maxOutSampleCT
+                                                 : curSampleCT;
+                double *genoOut = gbuf->extGenoOut;
+                if(genoOut == NULL){
+                    gbuf->geno.resize(outSampleCT);
+                    genoOut = gbuf->geno.data();
+                }
+                for(uint32_t j = 0; j < outSampleCT; j++){
+                    genoOut[j] = dos_lookup[dosages[j]];
                 }
                 // adjust for chr X;
                 if(isSexXY == 1){
@@ -1517,15 +1589,18 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     setMaleWeight(weight, needWeight);
                     if(needWeight){
                         if(bGRM){
-                            for(int i = 0 ; i < keepMaleSampleCT; i++){
-                                gbuf->geno[keepMaleExtractIndex[i]] *= weight;
+                            for(uint32_t i = 0 ; i < keepMaleSampleCT; i++){
+                                uint32_t curIndex = keepMaleExtractIndex[i];
+                                if(curIndex >= outSampleCT) break;
+                                genoOut[curIndex] *= weight;
                             }
                         }else{
                             double correctWeight = (weight - 1) * rdev * center_value;
-                            for(int i = 0 ; i < keepMaleSampleCT; i++){
+                            for(uint32_t i = 0 ; i < keepMaleSampleCT; i++){
                                 uint32_t curIndex = keepMaleExtractIndex[i];
-                                gbuf->geno[curIndex] *= weight;
-                                gbuf->geno[curIndex] += correctWeight;
+                                if(curIndex >= outSampleCT) break;
+                                genoOut[curIndex] *= weight;
+                                genoOut[curIndex] += correctWeight;
                             }
  
                         }
@@ -1533,11 +1608,19 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                 }
             }
             if(bMakeMiss){
-                gbuf->missing.resize(missPtrSize, 0); 
-                const int ptrsize = sizeof(uintptr_t) * CHAR_BIT;
-                for(int j = 0; j < miss_index.size(); j++){
-                    int cur_index = miss_index[j];
-                    gbuf->missing[cur_index / ptrsize] |= (1UL << (cur_index % ptrsize));
+                gbuf->packedGenoVec = NULL;
+                if(gbuf->skipDenseMissing){
+                    const uint32_t outSampleCT = (gbuf->maxOutSampleCT > 0 && gbuf->maxOutSampleCT < curSampleCT)
+                                                     ? gbuf->maxOutSampleCT
+                                                     : curSampleCT;
+                    gbuf->hasMissOut = (!miss_index.empty() && miss_index[0] < outSampleCT);
+                }else{
+                    gbuf->missing.assign(missPtrSize, 0);
+                    const int ptrsize = sizeof(uintptr_t) * CHAR_BIT;
+                    for(size_t j = 0; j < miss_index.size(); j++){
+                        uint32_t cur_index = miss_index[j];
+                        gbuf->missing[cur_index / ptrsize] |= (static_cast<uintptr_t>(1) << (cur_index % ptrsize));
+                    }
                 }
             }
             return;
@@ -1550,12 +1633,23 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
 void Geno::setGRMMode(bool grm, bool dominace){
     this->bGRM = grm;
     this->bGRMDom = dominace;
+    if(!grm){
+        this->outSampleCTLimit = 0;
+    }
+}
+
+void Geno::setOutSampleLimit(uint32_t maxOutSampleCT){
+    this->outSampleCTLimit = maxOutSampleCT;
 }
 
 void Geno::endGenoDouble_bed(){
     delete asyncBuf64;
     delete[] keepMaskPtr;
     delete[] keepMaskInterPtr;
+    if(outKeepMaskPtr){
+        delete[] outKeepMaskPtr;
+        outKeepMaskPtr = NULL;
+    }
 
     delete[] sexMaskPtr;
     delete[] sexMaskInterPtr;

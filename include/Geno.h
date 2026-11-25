@@ -67,11 +67,16 @@ typedef struct GenoBuffer{
 typedef struct GenoBufItem{
     // in
     uint32_t extractedMarkerIndex;   // for allele lookup
+    double *extGenoOut = NULL;       // optional external destination for unpacked standardized genotypes
+    uint32_t maxOutSampleCT = 0;     // 0 => keepSampleCT; >0 => unpack prefix [0, min(maxOutSampleCT, keepSampleCT))
+    bool skipDenseMissing = false;   // skip dense missing bitvector construction when sparse/packed missingness suffices
 
     // out
     bool valid;
   //  int refAllele; //0 as 1, 1 as GCTA
     uint8_t isSexXY;   // 0: no, 1: X, 2: Y
+    bool hasMissOut = false;
+    const uintptr_t *packedGenoVec = NULL;
     vector<double> geno;
     vector<uintptr_t> missing;
     vector<uintptr_t> subsetBuf;
@@ -151,6 +156,7 @@ public:
     bool getGenoHasInfo();
 
     void setGRMMode(bool grm, bool dominace);
+    void setOutSampleLimit(uint32_t maxOutSampleCT);
     void setGenoItemSize(uint32_t &genoSize, uint32_t &missSize);
  
 private:
@@ -337,9 +343,11 @@ private:
     int missPtrSize;
     uint32_t rawSampleCT;
     uint32_t keepSampleCT;
+    uint32_t outSampleCTLimit = 0;
 
     uintptr_t *keepMaskPtr = NULL;
     uintptr_t *keepMaskInterPtr = NULL; 
+    uintptr_t *outKeepMaskPtr = NULL;
     
     uint32_t keepSexSampleCT;
     uint32_t keepMaleSampleCT;
