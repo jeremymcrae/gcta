@@ -1,101 +1,117 @@
-//
-// Created by Zhili Zheng on 31/3/17.
-//
-#include "gtest/gtest.h"
-#include "test_config.h"
-#include "Logger.h"
-#include <thread>
-#include <chrono>
+#include <gtest/gtest.h>
 #include "AsyncBuffer.hpp"
+#include <chrono>
+#include <cstdint>
+#include <thread>
 #include <tuple>
-using std::thread;
 
-TEST(buffer_test, single_test){
-    AsyncBuffer<uint8_t> buf(3);
-    thread writer([&](){
-        LOGGER.m(0, "Write start");
-        int i = 0;
-        uint8_t *w_buf = NULL;
-        while(true){
-            w_buf = NULL;
-            while(true){
-                w_buf = buf.start_write();
-                if(!w_buf){
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }else{
-                    break;
-                }
-            }
-            *w_buf = i;
-            *(w_buf+1) = i + 10;
-            *(w_buf+2) = i + 100;
-            LOGGER.m(0, "writing " + to_string(*w_buf) + " " + to_string(*(w_buf+1)) + " " + to_string(*(w_buf+2)));
-            if(i > 50){
-                buf.setEOF();
-                buf.end_write();
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            buf.end_write();
-            LOGGER.m(2, "written");
-            //std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            i++;
-        }
-    });
-/*
-    thread reader2([&](){
-        LOGGER.m(0,"Read 2 start");
-        bool c_flag = true;
-        uint16_t *r_buf = NULL;
-        bool isEOF = false;
-        while(c_flag){
-            r_buf = NULL;
-            isEOF = false;
-            while(true){
-                std::tie(r_buf, isEOF) = buf.start_read();
-                if(!r_buf){
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }else{
-                    break;
-                }
-            }
-            LOGGER.m(0, "read " + to_string(*r_buf) + " " + to_string(*(r_buf+1)) + " " + to_string(*(r_buf+2)));
-            buf.end_read();
-            if(isEOF) {
-                c_flag = false;
-            }
-        }
-    });
-    */
+TEST(AsyncBufferTest, AlignmentAndInitStatus) {
+    AsyncBuffer<double> buf(128);
+    ASSERT_TRUE(buf.init_status());
+    double* slot = buf.start_write();
+    ASSERT_NE(slot, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(slot) % 64ULL, 0ULL);
+    buf.setEOF();
+    buf.end_write();
 
-    thread reader([&](){
-        LOGGER.m(0,"Read 1 start");
-        bool c_flag = true;
-        uint8_t *r_buf = NULL;
-        bool isEOF = false;
-        while(c_flag){
-            r_buf = NULL;
-            isEOF = false;
-            while(true){
-                std::tie(r_buf, isEOF) = buf.start_read();
-                if(!r_buf){
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }else{
-                    break;
-                }
-            }
-            LOGGER.m(0, "reading " + to_string(*r_buf) + " " + to_string(*(r_buf+1)) + " " + to_string(*(r_buf+2)));
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            buf.end_read();
-            LOGGER.m(2, "end read");
-            if(isEOF) {
-                c_flag = false;
-            }
-        }
-    });
-
-    writer.join();
-    reader.join();
-    //reader2.join();
+    double* rslot = nullptr;
+    bool eof = false;
+    std::tie(rslot, eof) = buf.start_read();
+    EXPECT_EQ(rslot, slot);
+    EXPECT_TRUE(eof);
+    buf.end_read();
 }
 
+TEST(AsyncBufferTest, ProducerConsumerPreserveOrderAndValues) {
+    const int n_chunks = 64;
+    AsyncBuffer<uint8_t> buf(3);
+    ASSERT_TRUE(buf.init_status());
+
+    std::thread writer([&buf, n_chunks]() {
+        for (int i = 0; i < n_chunks; ++i) {
+            uint8_t* slot = buf.start_write();
+            slot[0] = static_cast<uint8_t>(i);
+            slot[1] = static_cast<uint8_t>(i + 10);
+            slot[2] = static_cast<uint8_t>(i + 100);
+            if (i + 1 == n_chunks) {
+                buf.setEOF();
+            }
+            buf.end_write();
+        }
+    });
+
+    int seen = 0;
+    while (true) {
+        bool eof = false;
+        uint8_t* slot = nullptr;
+        std::tie(slot, eof) = buf.start_read();
+        ASSERT_NE(slot, nullptr);
+        EXPECT_EQ(slot[0], static_cast<uint8_t>(seen));
+        EXPECT_EQ(slot[1], static_cast<uint8_t>(seen + 10));
+        EXPECT_EQ(slot[2], static_cast<uint8_t>(seen + 100));
+        buf.end_read();
+        ++seen;
+        if (eof) break;
+    }
+    writer.join();
+    EXPECT_EQ(seen, n_chunks);
+}
+
+TEST(AsyncBufferTest, BackpressureWhenConsumerIsSlow) {
+    const int n_chunks = 20;
+    const int block_words = 256;
+    AsyncBuffer<uint64_t> buf(block_words);
+    ASSERT_TRUE(buf.init_status());
+
+    std::thread writer([&buf, n_chunks, block_words]() {
+        for (int c = 0; c < n_chunks; ++c) {
+            uint64_t* slot = buf.start_write();
+            for (int k = 0; k < block_words; ++k) {
+                slot[k] = static_cast<uint64_t>(c) * 10000ULL + static_cast<uint64_t>(k);
+            }
+            if (c + 1 == n_chunks) {
+                buf.setEOF();
+            }
+            buf.end_write();
+        }
+    });
+
+    int read_chunks = 0;
+    while (true) {
+        bool eof = false;
+        uint64_t* slot = nullptr;
+        std::tie(slot, eof) = buf.start_read();
+        ASSERT_NE(slot, nullptr);
+        if (read_chunks % 5 == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        for (int k = 0; k < block_words; ++k) {
+            ASSERT_EQ(slot[k], static_cast<uint64_t>(read_chunks) * 10000ULL + static_cast<uint64_t>(k));
+        }
+        buf.end_read();
+        ++read_chunks;
+        if (eof) break;
+    }
+    writer.join();
+    EXPECT_EQ(read_chunks, n_chunks);
+}
+
+TEST(AsyncBufferTest, SentinelEofChunkSignalsEndCleanly) {
+    AsyncBuffer<uintptr_t> buf(16);
+    ASSERT_TRUE(buf.init_status());
+    std::thread writer([&buf]() {
+        uintptr_t* slot = buf.start_write();
+        slot[0] = 42ULL;
+        buf.setEOF();
+        buf.end_write();
+    });
+
+    bool eof = false;
+    uintptr_t* slot = nullptr;
+    std::tie(slot, eof) = buf.start_read();
+    ASSERT_NE(slot, nullptr);
+    EXPECT_EQ(slot[0], 42ULL);
+    EXPECT_TRUE(eof);
+    buf.end_read();
+    writer.join();
+}
