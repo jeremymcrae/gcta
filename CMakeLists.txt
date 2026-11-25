@@ -230,8 +230,9 @@ else()
             MESSAGE(FATAL_ERROR "Failed to find static archives (.a) for gsl, gslcblas, sqlite3, zstd, or zlib")
         endif()
         set(GCTA_SYSTEM_LIBS
-            ${lib_gsl} ${lib_gslcblas} ${lib_sqlite3} ${lib_zstd} ${lib_z}
+            ${lib_gsl}
             -Wl,--start-group ${BLAS_LIB} -Wl,--end-group
+            ${lib_gslcblas} ${lib_sqlite3} ${lib_zstd} ${lib_z}
             gomp pthread m dl)
         target_link_libraries(gcta64
             -Wl,--start-group mainV1 ${libs_list} Pgenlib -Wl,--end-group
