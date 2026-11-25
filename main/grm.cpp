@@ -11,8 +11,124 @@
  */
 
 #include "gcta.h"
+#include "cpu_f77blas.h"
+#include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <iterator>
+#include <omp.h>
 #include <unordered_set>
+#include <zlib.h>
+
+#if GCTA_CPU_ARM || defined(OPENBLAS_CONST)
+extern "C" {
+int openblas_get_num_threads(void);
+void openblas_set_num_threads(int num_threads);
+}
+#endif
+
+namespace {
+
+static inline uint32_t popcount_u64(uint64_t x) {
+#if defined(_MSC_VER) && defined(_WIN64)
+    return static_cast<uint32_t>(__popcnt64(x));
+#elif defined(_MSC_VER)
+    return static_cast<uint32_t>(__popcnt(static_cast<uint32_t>(x)) + __popcnt(static_cast<uint32_t>(x >> 32)));
+#else
+    return static_cast<uint32_t>(__builtin_popcountll(x));
+#endif
+}
+
+struct ScopedSingleThreadBLASV1 {
+    int prev_omp;
+#if GCTA_CPU_ARM || defined(OPENBLAS_CONST)
+    int prev_threads;
+    ScopedSingleThreadBLASV1()
+        : prev_omp(omp_get_max_threads()),
+          prev_threads(openblas_get_num_threads()) {
+        openblas_set_num_threads(1);
+        omp_set_num_threads(prev_omp);
+    }
+    ~ScopedSingleThreadBLASV1() {
+        openblas_set_num_threads(prev_threads > 0 ? prev_threads : prev_omp);
+        omp_set_num_threads(prev_omp);
+    }
+#else
+    ScopedSingleThreadBLASV1() : prev_omp(omp_get_max_threads()) {}
+    ~ScopedSingleThreadBLASV1() {}
+#endif
+    struct ThreadLocal {
+        ThreadLocal() {
+#if GCTA_CPU_x86
+            mkl_set_num_threads_local(1);
+#endif
+        }
+        ~ThreadLocal() {
+#if GCTA_CPU_x86
+            mkl_set_num_threads_local(0);
+#endif
+        }
+    };
+};
+
+// 2D cache-tiled OpenMP lower-triangular C = A * A^T (column-major float, n x k)
+static void parallelTiledSyrkFloatLower(int n, int k, const float *A, float *C) {
+    if (n <= 0 || k <= 0) return;
+    ScopedSingleThreadBLASV1 blas_guard;
+    char uplo = 'L', notrans = 'N', trans = 'T';
+    float alpha = 1.0f, beta = 0.0f;
+    const int nthreads = omp_get_max_threads();
+    if (nthreads <= 1 || n <= 256) {
+        ScopedSingleThreadBLASV1::ThreadLocal tl_guard;
+#if GCTA_CPU_x86
+        ssyrk(&uplo, &notrans, &n, &k, &alpha, A, &n, &beta, C, &n);
+#else
+        ssyrk_(&uplo, &notrans, &n, &k, &alpha, const_cast<float *>(A), &n, &beta, C, &n);
+#endif
+        return;
+    }
+
+    int nb = static_cast<int>(std::sqrt((0.5 * static_cast<double>(n) * static_cast<double>(n)) / (8.0 * nthreads)));
+    nb = ((nb + 32) / 64) * 64;
+    if (nb < 128) nb = 128;
+    if (nb > 768) nb = 768;
+
+    const int nblk = (n + nb - 1) / nb;
+    const int ntiles = nblk * (nblk + 1) / 2;
+
+    #pragma omp parallel
+    {
+        ScopedSingleThreadBLASV1::ThreadLocal tl_guard;
+        #pragma omp for schedule(dynamic, 1)
+        for (int t = 0; t < ntiles; ++t) {
+            int bi = static_cast<int>((std::sqrt(8.0 * static_cast<double>(t) + 1.0) - 1.0) * 0.5);
+            while ((bi + 1) * (bi + 2) / 2 <= t) ++bi;
+            while (bi * (bi + 1) / 2 > t) --bi;
+            const int bj = t - bi * (bi + 1) / 2;
+
+            const int i0 = bi * nb;
+            const int j0 = bj * nb;
+            int tm = std::min(nb, n - i0);
+            int tn = std::min(nb, n - j0);
+            float *c_ptr = C + static_cast<size_t>(j0) * static_cast<size_t>(n) + i0;
+            if (bi == bj) {
+#if GCTA_CPU_x86
+                ssyrk(&uplo, &notrans, &tm, &k, &alpha, A + i0, &n, &beta, c_ptr, &n);
+#else
+                ssyrk_(&uplo, &notrans, &tm, &k, &alpha, const_cast<float *>(A + i0), &n, &beta, c_ptr, &n);
+#endif
+            } else {
+#if GCTA_CPU_x86
+                sgemm(&notrans, &trans, &tm, &tn, &k, &alpha, A + i0, &n, A + j0, &n, &beta, c_ptr, &n);
+#else
+                sgemm_(&notrans, &trans, &tm, &tn, &k, &alpha, const_cast<float *>(A + i0), &n, const_cast<float *>(A + j0), &n, &beta, c_ptr, &n);
+#endif
+            }
+        }
+    }
+}
+
+} // namespace
 
 void gcta::enable_grm_bin_flag() {
     _grm_bin_flag = true;
@@ -65,19 +181,20 @@ void gcta::make_grm(bool grm_d_flag, bool grm_xchr_flag, bool inbred, bool outpu
 
     // count the number of missing genotypes
     vector< vector<int> > miss_pos;
-    vector< vector<bool> > X_bool;
+    const size_t words_m = (m + 63) / 64;
+    vector<uint64_t> obs_bits;
     if(have_mis){
         miss_pos.resize(n);
-        X_bool.resize(n);
-        #pragma omp parallel for private(j)
-        for (i = 0; i < n; i++) {
-            X_bool[i].resize(m);
-            for (j = 0; j < m; j++) {
-                if (_geno(i,j) < 1e5) X_bool[i][j] = true;
-                else {
-                    _geno(i,j) = 0.0;
-                    miss_pos[i].push_back(j);
-                    X_bool[i][j] = false;
+        obs_bits.assign(n * words_m, 0ULL);
+        #pragma omp parallel for schedule(static)
+        for (long ii = 0; ii < (long)n; ii++) {
+            uint64_t *row_obs = obs_bits.data() + (size_t)ii * words_m;
+            for (unsigned long jj = 0; jj < m; jj++) {
+                if (_geno(ii, jj) < 1e5f) {
+                    row_obs[jj >> 6] |= (1ULL << (jj & 63));
+                } else {
+                    _geno(ii, jj) = 0.0f;
+                    miss_pos[ii].push_back((int)jj);
                 }
             }
         }
@@ -86,36 +203,77 @@ void gcta::make_grm(bool grm_d_flag, bool grm_xchr_flag, bool inbred, bool outpu
     // Calculate A_N matrix
     if(have_mis){
         _grm_N.resize(n, n);
-        #pragma omp parallel for private(j, k)
-        for (i = 0; i < n; i++) {
-            for (j = 0; j <= i; j++) {
-                int miss_j = 0;
-                for (k = 0; k < miss_pos[j].size(); k++) miss_j += (int) X_bool[i][miss_pos[j][k]];
-                _grm_N(i,j) = m - miss_pos[i].size() - miss_j;
-                _grm_N(j,i) = _grm_N(i,j);
+        const size_t sparse_cut = m / 32 + 64;
+        #pragma omp parallel for schedule(dynamic, 16)
+        for (long ii = 0; ii < (long)n; ii++) {
+            const uint64_t *obs_i = obs_bits.data() + (size_t)ii * words_m;
+            const size_t miss_i = miss_pos[ii].size();
+            for (long jj = 0; jj <= ii; jj++) {
+                const vector<int> &mp_j = miss_pos[jj];
+                float n_pair = 0.0f;
+                if (mp_j.size() <= sparse_cut) {
+                    int miss_j = 0;
+                    for (size_t kk = 0; kk < mp_j.size(); kk++) {
+                        const uint32_t col = static_cast<uint32_t>(mp_j[kk]);
+                        miss_j += static_cast<int>((obs_i[col >> 6] >> (col & 63)) & 1ULL);
+                    }
+                    n_pair = static_cast<float>(m - miss_i - static_cast<size_t>(miss_j));
+                } else {
+                    const uint64_t *obs_j = obs_bits.data() + (size_t)jj * words_m;
+                    uint32_t common_obs = 0;
+                    for (size_t w = 0; w < words_m; w++) {
+                        common_obs += popcount_u64(obs_i[w] & obs_j[w]);
+                    }
+                    n_pair = static_cast<float>(common_obs);
+                }
+                _grm_N(ii, jj) = n_pair;
+                _grm_N(jj, ii) = n_pair;
+            }
+        }
+        obs_bits.clear();
+        obs_bits.shrink_to_fit();
+    }
+    else _grm_N = MatrixXf::Constant(n, n, m);
+
+    // Calculate WW' via symmetric rank-k update (lower triangle only -> 50% fewer FLOPs)
+    if (grm_mtd == 1) _grm_N = _grm_N.array() * sd_SNP.mean();
+
+    #ifdef SINGLE_PRECISION
+    if (n > 0 && m > 0) {
+        _grm.resize(n, n);
+        parallelTiledSyrkFloatLower(static_cast<int>(n), static_cast<int>(m), _geno.data(), _grm.data());
+    } else {
+        _grm.setZero(n, n);
+    }
+    #pragma omp parallel for schedule(dynamic, 32)
+    for (long ii = 0; ii < (long)n; ii++) {
+        for (long jj = 0; jj <= ii; jj++) {
+            if (_grm_N(ii, jj) > 0.0f) _grm(ii, jj) /= _grm_N(ii, jj);
+            else _grm(ii, jj) = 0.0f;
+            _grm(jj, ii) = _grm(ii, jj);
+        }
+    }
+    #else
+    {
+        MatrixXf grm_f;
+        if (n > 0 && m > 0) {
+            grm_f.resize(n, n);
+            parallelTiledSyrkFloatLower(static_cast<int>(n), static_cast<int>(m), _geno.data(), grm_f.data());
+        } else {
+            grm_f = MatrixXf::Zero(n, n);
+        }
+        _grm.resize(n, n);
+        #pragma omp parallel for schedule(dynamic, 32)
+        for (long ii = 0; ii < (long)n; ii++) {
+            for (long jj = 0; jj <= ii; jj++) {
+                const double denom = static_cast<double>(_grm_N(ii, jj));
+                const double val = (denom > 0.0) ? (static_cast<double>(grm_f(ii, jj)) / denom) : 0.0;
+                _grm(ii, jj) = val;
+                _grm(jj, ii) = val;
             }
         }
     }
-    else _grm_N = MatrixXf::Constant(n,n,m);
-
-    // Calcuate WW'
-    #ifdef SINGLE_PRECISION
-    _grm = _geno * _geno.transpose();
-    #else
-    _grm = (_geno * _geno.transpose()).cast<double>();
     #endif
-
-    // Calculate A matrix
-    if (grm_mtd == 1) _grm_N = _grm_N.array() * sd_SNP.mean();
-
-    #pragma omp parallel for private(j)
-    for (i = 0; i < n; i++) {
-        for (j = 0; j <= i; j++) {
-            if(_grm_N(i,j) > 0) _grm(i,j) /= _grm_N(i,j);
-            else _grm(i,j) = 0.0;
-            _grm(j,i) = _grm(i,j);
-        }
-    }
 
     // GRM summary
     double diag_m = 0.0, diag_v = 0.0, off_m = 0.0, off_v = 0.0;
@@ -173,79 +331,191 @@ void gcta::make_grm(bool grm_d_flag, bool grm_xchr_flag, bool inbred, bool outpu
 
 void gcta::calcu_grm_var(double &diag_m, double &diag_v, double &off_m, double &off_v)
 {
-    int i = 0, n = _keep.size();
+    const long n = static_cast<long>(_keep.size());
     diag_m = _grm.diagonal().mean();
-    diag_v = (_grm.diagonal() - eigenVector::Constant(n, diag_m)).squaredNorm() / ((double)n - 1.0);
-    double off_num = 0.5*n*(n - 1.0);
-    off_m = 0.0;
-    for (i = 1; i < n; i++) off_m += _grm.row(i).segment(0, i).sum();
-    off_m /= off_num;
-    off_v = 0.0;
-    for (i = 1; i < n; i++) off_v += (_grm.row(i).segment(0, i) -  eigenVector::Constant(i, off_m).transpose()).squaredNorm();
-    off_v /= (off_num - 1.0);    
+    diag_v = (_grm.diagonal().array() - diag_m).square().sum() / ((double)n - 1.0);
+    const double off_num = 0.5 * n * (n - 1.0);
+    double sum_off = 0.0;
+    #pragma omp parallel for reduction(+:sum_off) schedule(dynamic, 64)
+    for (long c = 0; c < n - 1; c++) {
+        double col_sum = 0.0;
+        for (long r = c + 1; r < n; r++) {
+            col_sum += _grm(r, c);
+        }
+        sum_off += col_sum;
+    }
+    off_m = sum_off / off_num;
+
+    double sq_off = 0.0;
+    #pragma omp parallel for reduction(+:sq_off) schedule(dynamic, 64)
+    for (long c = 0; c < n - 1; c++) {
+        double col_sq = 0.0;
+        for (long r = c + 1; r < n; r++) {
+            const double diff = _grm(r, c) - off_m;
+            col_sq += diff * diff;
+        }
+        sq_off += col_sq;
+    }
+    off_v = sq_off / (off_num - 1.0);
 }
 
 void gcta::output_grm(bool output_grm_bin)
 {
-    int i = 0, j = 0;
+    const long n_keep = static_cast<long>(_keep.size());
     string grm_file;
     if (output_grm_bin) {
-        // Save matrix A in binary file
+        // Save matrix A in binary file using buffered stripe writes
         grm_file = _out + ".grm.bin";
-        fstream A_Bin(grm_file.c_str(), ios::out | ios::binary);
+        FILE *A_Bin = fopen(grm_file.c_str(), "wb");
         if (!A_Bin) LOGGER.e(0, "cannot open the file [" + grm_file + "] to write.");
-        float f_buf = 0.0;
-        int size = sizeof (float);
-        for (i = 0; i < _keep.size(); i++) {
-            for (j = 0; j <= i; j++) {
-                f_buf = (float) (_grm(i, j));
-                A_Bin.write((char*) &f_buf, size);
+        setvbuf(A_Bin, NULL, _IOFBF, 4 * 1024 * 1024);
+
+        const long kStripeRows = 256;
+        vector<float> stripe_buf(static_cast<size_t>(kStripeRows) * static_cast<size_t>(std::max<long>(1, n_keep)));
+        vector<size_t> row_off(kStripeRows + 1, 0);
+
+        for (long r0 = 0; r0 < n_keep; r0 += kStripeRows) {
+            const long r_cnt = std::min<long>(kStripeRows, n_keep - r0);
+            row_off[0] = 0;
+            for (long dr = 0; dr < r_cnt; dr++) {
+                row_off[dr + 1] = row_off[dr] + static_cast<size_t>(r0 + dr + 1);
+            }
+            #pragma omp parallel for schedule(static)
+            for (long dr = 0; dr < r_cnt; dr++) {
+                const long r = r0 + dr;
+                float *dst = stripe_buf.data() + row_off[dr];
+                for (long c = 0; c <= r; c++) {
+                    dst[c] = static_cast<float>(_grm(r, c));
+                }
+            }
+            const size_t n_elems = row_off[r_cnt];
+            if (n_elems > 0 && fwrite(stripe_buf.data(), sizeof(float), n_elems, A_Bin) != n_elems) {
+                fclose(A_Bin);
+                LOGGER.e(0, "Failed to write to [" + grm_file + "].");
             }
         }
-        A_Bin.close();
-        LOGGER << "GRM of " << _keep.size() << " individuals has been saved in the file [" + grm_file + "] (in binary format)." << endl;
+        fclose(A_Bin);
+        LOGGER << "GRM of " << n_keep << " individuals has been saved in the file [" + grm_file + "] (in binary format)." << endl;
 
         string grm_N_file = _out + ".grm.N.bin";
-        fstream N_Bin(grm_N_file.c_str(), ios::out | ios::binary);
+        FILE *N_Bin = fopen(grm_N_file.c_str(), "wb");
         if (!N_Bin) LOGGER.e(0, "cannot open the file [" + grm_N_file + "] to write.");
-        f_buf = 0.0;
-        size = sizeof (int);
-        for (i = 0; i < _keep.size(); i++) {
-            for (j = 0; j <= i; j++) {
-                f_buf = (float) (_grm_N(i, j));
-                N_Bin.write((char*) &f_buf, size);
+        setvbuf(N_Bin, NULL, _IOFBF, 4 * 1024 * 1024);
+
+        for (long r0 = 0; r0 < n_keep; r0 += kStripeRows) {
+            const long r_cnt = std::min<long>(kStripeRows, n_keep - r0);
+            row_off[0] = 0;
+            for (long dr = 0; dr < r_cnt; dr++) {
+                row_off[dr + 1] = row_off[dr] + static_cast<size_t>(r0 + dr + 1);
+            }
+            #pragma omp parallel for schedule(static)
+            for (long dr = 0; dr < r_cnt; dr++) {
+                const long r = r0 + dr;
+                float *dst = stripe_buf.data() + row_off[dr];
+                for (long c = 0; c <= r; c++) {
+                    dst[c] = static_cast<float>(_grm_N(r, c));
+                }
+            }
+            const size_t n_elems = row_off[r_cnt];
+            if (n_elems > 0 && fwrite(stripe_buf.data(), sizeof(float), n_elems, N_Bin) != n_elems) {
+                fclose(N_Bin);
+                LOGGER.e(0, "Failed to write to [" + grm_N_file + "].");
             }
         }
-        N_Bin.close();
+        fclose(N_Bin);
         LOGGER << "Number of SNPs to calculate the genetic relationship between each pair of individuals has been saved in the file [" + grm_N_file + "] (in binary format)." << endl;
-    } 
+    }
     else {
-        // Save A matrix in txt format
+        // Save A matrix in RFC-1952 multi-member gzip compressed text format (parallel pigz-style blocks)
         grm_file = _out + ".grm.gz";
-        gzofstream zoutf;
-        zoutf.open(grm_file.c_str());
-        if (!zoutf.is_open()) LOGGER.e(0, "cannot open the file [" + grm_file + "] to write.");
+        FILE *gz_fp = fopen(grm_file.c_str(), "wb");
+        if (!gz_fp) LOGGER.e(0, "cannot open the file [" + grm_file + "] to write.");
+        setvbuf(gz_fp, NULL, _IOFBF, 4 * 1024 * 1024);
         LOGGER << "Saving the genetic relationship matrix to the file [" + grm_file + "] (in compressed text format)." << endl;
-        zoutf.setf(ios::scientific);
-        zoutf.precision(6);
-        for (i = 0; i < _keep.size(); i++) {
-            if (_grm_N.rows() > 0){
-                zoutf.setf(ios::scientific);
-                zoutf.precision(6);
-                for (j = 0; j <= i; j++) zoutf << i + 1 << '\t' << j + 1 << '\t' << _grm_N(i, j) << '\t' << _grm(i, j) << endl;
+
+        auto compress_gzip_member = [](const char *src, size_t src_len, string &dst) -> bool {
+            z_stream zs;
+            std::memset(&zs, 0, sizeof(zs));
+            if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+                return false;
             }
-            else{ 
-                for (j = 0; j <= i; j++) zoutf << i + 1 << '\t' << j + 1 << "\t0\t" << _grm(i, j) << endl;
+            const uLong bound = deflateBound(&zs, static_cast<uLong>(src_len)) + 32;
+            dst.resize(bound);
+            zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(src));
+            zs.avail_in = static_cast<uInt>(src_len);
+            zs.next_out = reinterpret_cast<Bytef *>(&dst[0]);
+            zs.avail_out = static_cast<uInt>(dst.size());
+            const int ret = deflate(&zs, Z_FINISH);
+            const size_t out_bytes = zs.total_out;
+            deflateEnd(&zs);
+            if (ret != Z_STREAM_END) return false;
+            dst.resize(out_bytes);
+            return true;
+        };
+
+        const bool has_N = (_grm_N.rows() > 0);
+        if (n_keep <= 0) {
+            string empty_gz;
+            if (!compress_gzip_member("", 0, empty_gz) ||
+                fwrite(empty_gz.data(), 1, empty_gz.size(), gz_fp) != empty_gz.size()) {
+                fclose(gz_fp);
+                LOGGER.e(0, "Failed to write to [" + grm_file + "].");
+            }
+        } else {
+            const long kBatchBlocks = std::max<long>(8, omp_get_max_threads() * 4);
+            const long kRowsPerBlock = 16;
+            vector<string> gz_blocks(kBatchBlocks);
+            const long total_blocks = (n_keep + kRowsPerBlock - 1) / kRowsPerBlock;
+
+            for (long b0 = 0; b0 < total_blocks; b0 += kBatchBlocks) {
+                const long b_cnt = std::min<long>(kBatchBlocks, total_blocks - b0);
+                bool ok = true;
+                #pragma omp parallel for schedule(dynamic, 1) reduction(&:ok)
+                for (long db = 0; db < b_cnt; db++) {
+                    const long r_start = (b0 + db) * kRowsPerBlock;
+                    const long r_end = std::min<long>(n_keep, r_start + kRowsPerBlock);
+                    ostringstream oss;
+                    oss.setf(ios::scientific);
+                    oss.precision(6);
+                    if (has_N) {
+                        for (long r = r_start; r < r_end; r++) {
+                            for (long c = 0; c <= r; c++) {
+                                oss << (r + 1) << '\t' << (c + 1) << '\t' << _grm_N(r, c) << '\t' << _grm(r, c) << '\n';
+                            }
+                        }
+                    } else {
+                        for (long r = r_start; r < r_end; r++) {
+                            for (long c = 0; c <= r; c++) {
+                                oss << (r + 1) << '\t' << (c + 1) << "\t0\t" << _grm(r, c) << '\n';
+                            }
+                        }
+                    }
+                    const string raw_txt = oss.str();
+                    if (!compress_gzip_member(raw_txt.data(), raw_txt.size(), gz_blocks[db])) {
+                        ok = false;
+                    }
+                }
+                if (!ok) {
+                    fclose(gz_fp);
+                    LOGGER.e(0, "Failed to compress [" + grm_file + "].");
+                }
+                for (long db = 0; db < b_cnt; db++) {
+                    const string &blk = gz_blocks[db];
+                    if (!blk.empty() && fwrite(blk.data(), 1, blk.size(), gz_fp) != blk.size()) {
+                        fclose(gz_fp);
+                        LOGGER.e(0, "Failed to write to [" + grm_file + "].");
+                    }
+                }
             }
         }
-        zoutf.close();
+        fclose(gz_fp);
         LOGGER << "The genetic relationship matrix has been saved in the file [" + grm_file + "] (in compressed text format)." << endl;
     }
 
     string famfile = _out + ".grm.id";
     ofstream Fam(famfile.c_str());
     if (!Fam) LOGGER.e(0, "cannot open the file [" + famfile + "] to write.");
-    for (i = 0; i < _keep.size(); i++) Fam << _fid[_keep[i]] + "\t" + _pid[_keep[i]] << endl;
+    for (long i = 0; i < n_keep; i++) Fam << _fid[_keep[i]] << '\t' << _pid[_keep[i]] << '\n';
     Fam.close();
     LOGGER << "IDs for the GRM file [" + grm_file + "] have been saved in the file [" + famfile + "]." << endl;
 }
@@ -337,40 +607,76 @@ void gcta::read_grm_gz(string grm_file, vector<string> &grm_id, bool out_id_log,
 
 void gcta::read_grm_bin(string grm_file, vector<string> &grm_id, bool out_id_log, bool read_id_only, bool dont_read_N)
 {
-    int i = 0, j = 0, n = read_grm_id(grm_file, grm_id, out_id_log, read_id_only);
+    const long n = static_cast<long>(read_grm_id(grm_file, grm_id, out_id_log, read_id_only));
 
     if (read_id_only) return;
 
     string grm_binfile = grm_file + ".grm.bin";
-    ifstream A_bin(grm_binfile.c_str(), ios::in | ios::binary);
-    if (!A_bin.is_open()) LOGGER.e(0, "cannot open the file [" + grm_binfile + "] to read.");
+    FILE *A_bin = fopen(grm_binfile.c_str(), "rb");
+    if (!A_bin) LOGGER.e(0, "cannot open the file [" + grm_binfile + "] to read.");
+    setvbuf(A_bin, NULL, _IOFBF, 4 * 1024 * 1024);
+
     _grm.resize(n, n);
     LOGGER << "Reading the GRM from [" + grm_binfile + "]." << endl;
-    int size = sizeof (float);
-    float f_buf = 0.0;
-    for (i = 0; i < n; i++) {
-        for (j = 0; j <= i; j++) {
-            if (!(A_bin.read((char*) &f_buf, size))) LOGGER.e(0, "Is the size of the [" + grm_binfile + "] file incorrect?");
-            _grm(j, i) = _grm(i, j) = f_buf;
+    const long kStripeRows = 256;
+    vector<float> stripe_buf(static_cast<size_t>(kStripeRows) * static_cast<size_t>(std::max<long>(1, n)));
+    vector<size_t> row_off(kStripeRows + 1, 0);
+
+    for (long r0 = 0; r0 < n; r0 += kStripeRows) {
+        const long r_cnt = std::min<long>(kStripeRows, n - r0);
+        row_off[0] = 0;
+        for (long dr = 0; dr < r_cnt; dr++) {
+            row_off[dr + 1] = row_off[dr] + static_cast<size_t>(r0 + dr + 1);
+        }
+        const size_t n_elems = row_off[r_cnt];
+        if (n_elems > 0 && fread(stripe_buf.data(), sizeof(float), n_elems, A_bin) != n_elems) {
+            fclose(A_bin);
+            LOGGER.e(0, "Is the size of the [" + grm_binfile + "] file incorrect?");
+        }
+        #pragma omp parallel for schedule(static)
+        for (long dr = 0; dr < r_cnt; dr++) {
+            const long r = r0 + dr;
+            const float *src = stripe_buf.data() + row_off[dr];
+            for (long c = 0; c <= r; c++) {
+                const float val = src[c];
+                _grm(r, c) = val;
+                _grm(c, r) = val;
+            }
         }
     }
-    A_bin.close();
+    fclose(A_bin);
 
     if(!dont_read_N){
         string grm_Nfile = grm_file + ".grm.N.bin";
-        ifstream N_bin(grm_Nfile.c_str(), ios::in | ios::binary);
-        if (!N_bin.is_open()) LOGGER.e(0, "cannot open the file [" + grm_Nfile + "] to read.");
+        FILE *N_bin = fopen(grm_Nfile.c_str(), "rb");
+        if (!N_bin) LOGGER.e(0, "cannot open the file [" + grm_Nfile + "] to read.");
+        setvbuf(N_bin, NULL, _IOFBF, 4 * 1024 * 1024);
         _grm_N.resize(n, n);
         LOGGER << "Reading the number of SNPs for the GRM from [" + grm_Nfile + "]." << endl;
-        size = sizeof (float);
-        f_buf = 0.0;
-        for (i = 0; i < n; i++) {
-            for (j = 0; j <= i; j++) {
-                if (!(N_bin.read((char*) &f_buf, size))) LOGGER.e(0, "Is the size of the [" + grm_Nfile + "] file incorrect?");
-                _grm_N(j, i) = _grm_N(i, j) = f_buf;
+
+        for (long r0 = 0; r0 < n; r0 += kStripeRows) {
+            const long r_cnt = std::min<long>(kStripeRows, n - r0);
+            row_off[0] = 0;
+            for (long dr = 0; dr < r_cnt; dr++) {
+                row_off[dr + 1] = row_off[dr] + static_cast<size_t>(r0 + dr + 1);
+            }
+            const size_t n_elems = row_off[r_cnt];
+            if (n_elems > 0 && fread(stripe_buf.data(), sizeof(float), n_elems, N_bin) != n_elems) {
+                fclose(N_bin);
+                LOGGER.e(0, "Is the size of the [" + grm_Nfile + "] file incorrect?");
+            }
+            #pragma omp parallel for schedule(static)
+            for (long dr = 0; dr < r_cnt; dr++) {
+                const long r = r0 + dr;
+                const float *src = stripe_buf.data() + row_off[dr];
+                for (long c = 0; c <= r; c++) {
+                    const float val = src[c];
+                    _grm_N(r, c) = val;
+                    _grm_N(c, r) = val;
+                }
             }
         }
-        N_bin.close();
+        fclose(N_bin);
     }
 
     LOGGER << "GRM for " << n << " individuals are included from [" + grm_binfile + "]." << endl;
@@ -379,46 +685,55 @@ void gcta::read_grm_bin(string grm_file, vector<string> &grm_id, bool out_id_log
 void gcta::rm_cor_indi(double grm_cutoff) {
     LOGGER << "Pruning the GRM with a cutoff of " << grm_cutoff << " ..." << endl;
 
-    int i = 0, j = 0, i_buf = 0;
+    const long n_keep = static_cast<long>(_keep.size());
+    const int n_threads = std::max(1, omp_get_max_threads());
+    vector<vector<pair<int, int>>> thread_pairs(n_threads);
 
-    // identify the positions where you see a value > than the threshold
-    vector<int> rm_grm_ID1, rm_grm_ID2;
-    for (i = 0; i < _keep.size(); i++) {
-        for (j = 0; j < i; j++) {
-            if (_grm(_keep[i], _keep[j]) > grm_cutoff) {
-                rm_grm_ID1.push_back(_keep[i]);
-                rm_grm_ID2.push_back(_keep[j]);
+    #pragma omp parallel num_threads(n_threads)
+    {
+        const int tid = omp_get_thread_num();
+        vector<pair<int, int>> &local_pairs = thread_pairs[tid];
+        #pragma omp for schedule(dynamic, 32)
+        for (long i = 0; i < n_keep; i++) {
+            const int ki = _keep[i];
+            for (long j = 0; j < i; j++) {
+                const int kj = _keep[j];
+                if (_grm(ki, kj) > grm_cutoff) {
+                    local_pairs.push_back(std::make_pair(ki, kj));
+                }
             }
         }
     }
 
-    // count the number of appearance of each "position" in the vector, which involves a few steps
-    vector<int> rm_uni_ID(rm_grm_ID1);
-    rm_uni_ID.insert(rm_uni_ID.end(), rm_grm_ID2.begin(), rm_grm_ID2.end());
-    stable_sort(rm_uni_ID.begin(), rm_uni_ID.end());
-    rm_uni_ID.erase(unique(rm_uni_ID.begin(), rm_uni_ID.end()), rm_uni_ID.end());
-    map<int, int> rm_uni_ID_count;
-    for (i = 0; i < rm_uni_ID.size(); i++) {
-        i_buf = count(rm_grm_ID1.begin(), rm_grm_ID1.end(), rm_uni_ID[i]) + count(rm_grm_ID2.begin(), rm_grm_ID2.end(), rm_uni_ID[i]);
-        rm_uni_ID_count.insert(pair<int, int>(rm_uni_ID[i], i_buf));
+    size_t total_pairs = 0;
+    for (int t = 0; t < n_threads; t++) total_pairs += thread_pairs[t].size();
+    vector<pair<int, int>> rel_pairs;
+    rel_pairs.reserve(total_pairs);
+    for (int t = 0; t < n_threads; t++) {
+        rel_pairs.insert(rel_pairs.end(), thread_pairs[t].begin(), thread_pairs[t].end());
     }
 
-    // swapping
-    map<int, int>::iterator iter1, iter2;
-    for (i = 0; i < rm_grm_ID1.size(); i++) {
-        iter1 = rm_uni_ID_count.find(rm_grm_ID1[i]);
-        iter2 = rm_uni_ID_count.find(rm_grm_ID2[i]);
-        if (iter1->second < iter2->second) {
-            i_buf = rm_grm_ID1[i];
-            rm_grm_ID1[i] = rm_grm_ID2[i];
-            rm_grm_ID2[i] = i_buf;
+    const size_t n_total_id = _fid.size();
+    vector<int> deg(n_total_id, 0);
+    for (size_t k = 0; k < rel_pairs.size(); k++) {
+        deg[rel_pairs[k].first]++;
+        deg[rel_pairs[k].second]++;
+    }
+
+    vector<uint8_t> removed_mask(n_total_id, 0);
+    for (size_t k = 0; k < rel_pairs.size(); k++) {
+        const int id1 = rel_pairs[k].first;
+        const int id2 = rel_pairs[k].second;
+        const int rm_id = (deg[id1] < deg[id2]) ? id2 : id1;
+        removed_mask[rm_id] = 1;
+    }
+
+    vector<string> removed_ID;
+    for (size_t id = 0; id < n_total_id; id++) {
+        if (removed_mask[id]) {
+            removed_ID.push_back(_fid[id] + ":" + _pid[id]);
         }
     }
-    
-    stable_sort(rm_grm_ID1.begin(), rm_grm_ID1.end());
-    rm_grm_ID1.erase(unique(rm_grm_ID1.begin(), rm_grm_ID1.end()), rm_grm_ID1.end());
-    vector<string> removed_ID;
-    for (i = 0; i < rm_grm_ID1.size(); i++) removed_ID.push_back(_fid[rm_grm_ID1[i]] + ":" + _pid[rm_grm_ID1[i]]);
 
     // update _keep and _id_map
     update_id_map_rm(removed_ID, _id_map, _keep);
@@ -428,29 +743,45 @@ void gcta::rm_cor_indi(double grm_cutoff) {
 
 void gcta::adj_grm(double adj_grm_fac) {
     LOGGER << "Adjusting the GRM for sampling errors ..." << endl;
-    int i = 0, j = 0, n = _keep.size();
-    double off_mean = 0.0, diag_mean = 0.0, off_var = 0.0, diag_var = 0.0, d_buf = 0.0;
-    for (i = 0; i < n; i++) {
-        diag_mean += _grm(_keep[i], _keep[i]);
-        for (j = 0; j < i; j++) off_mean += _grm(_keep[i], _keep[j]);
+    const long n = static_cast<long>(_keep.size());
+    double off_mean = 0.0, diag_mean = 0.0, off_var = 0.0, diag_var = 0.0;
+    #pragma omp parallel for reduction(+:diag_mean, off_mean) schedule(dynamic, 32)
+    for (long i = 0; i < n; i++) {
+        const int ki = _keep[i];
+        diag_mean += _grm(ki, ki);
+        double row_off = 0.0;
+        for (long j = 0; j < i; j++) row_off += _grm(ki, _keep[j]);
+        off_mean += row_off;
     }
     diag_mean /= n;
     off_mean /= 0.5 * n * (n - 1.0);
-    for (i = 0; i < n; i++) {
-        d_buf = _grm(_keep[i], _keep[i]) - diag_mean;
-        diag_var += d_buf*d_buf;
-        for (j = 0; j < i; j++) {
-            d_buf = _grm(_keep[i], _keep[j]) - off_mean;
-            off_var += d_buf*d_buf;
+
+    #pragma omp parallel for reduction(+:diag_var, off_var) schedule(dynamic, 32)
+    for (long i = 0; i < n; i++) {
+        const int ki = _keep[i];
+        const double d_diag = _grm(ki, ki) - diag_mean;
+        diag_var += d_diag * d_diag;
+        double row_var = 0.0;
+        for (long j = 0; j < i; j++) {
+            const double d_off = _grm(ki, _keep[j]) - off_mean;
+            row_var += d_off * d_off;
         }
+        off_var += row_var;
     }
     diag_var /= n - 1.0;
     off_var /= 0.5 * n * (n - 1.0) - 1.0;
-    for (i = 0; i < _keep.size(); i++) {
-        d_buf = 1.0 - (adj_grm_fac + 1.0 / _grm_N(_keep[i], _keep[i])) / diag_var;
-        if (_grm(_keep[i], _keep[i]) > 0) _grm(_keep[i], _keep[i]) = 1.0 + d_buf * (_grm(_keep[i], _keep[i]) - 1.0);
-        for (j = 0; j < i; j++) {
-            if (_grm_N(_keep[i], _keep[j]) > 0) _grm(_keep[i], _keep[j]) *= 1.0 - (adj_grm_fac + 1.0 / _grm_N(_keep[i], _keep[j])) / off_var;
+
+    #pragma omp parallel for schedule(dynamic, 32)
+    for (long i = 0; i < n; i++) {
+        const int ki = _keep[i];
+        const double d_buf = 1.0 - (adj_grm_fac + 1.0 / _grm_N(ki, ki)) / diag_var;
+        if (_grm(ki, ki) > 0) _grm(ki, ki) = 1.0 + d_buf * (_grm(ki, ki) - 1.0);
+        for (long j = 0; j < i; j++) {
+            const int kj = _keep[j];
+            if (_grm_N(ki, kj) > 0) {
+                _grm(ki, kj) *= 1.0 - (adj_grm_fac + 1.0 / _grm_N(ki, kj)) / off_var;
+                _grm(kj, ki) = _grm(ki, kj);
+            }
         }
     }
 }
@@ -494,17 +825,34 @@ void gcta::manipulate_grm(string grm_file, string keep_indi_file, string remove_
     if (adj_grm_fac>-1.0) adj_grm(adj_grm_fac);
     if (dosage_compen>-1) dc(dosage_compen);
     if (grm_cutoff>-1.0 || !keep_indi_file.empty() || !remove_indi_file.empty()) {
-        eigenMatrix grm_buf(_grm);
-        _grm.resize(_keep.size(), _keep.size());
-        for (i = 0; i < _keep.size(); i++) {
-            for (j = 0; j <= i; j++) _grm(i, j) = grm_buf(_keep[i], _keep[j]);
+        const long nk = static_cast<long>(_keep.size());
+        eigenMatrix grm_buf;
+        grm_buf.swap(_grm);
+        _grm.resize(nk, nk);
+        #pragma omp parallel for schedule(dynamic, 32)
+        for (long r = 0; r < nk; r++) {
+            const int kr = _keep[r];
+            for (long c = 0; c <= r; c++) {
+                const int kc = _keep[c];
+                const auto val = (kr >= kc) ? grm_buf(kr, kc) : grm_buf(kc, kr);
+                _grm(r, c) = val;
+                _grm(c, r) = val;
+            }
         }
-        grm_buf.resize(0,0);
+        grm_buf.resize(0, 0);
         if(!dont_read_N){
-            MatrixXf grm_N_buf = _grm_N;
-            _grm_N.resize(_keep.size(), _keep.size());
-            for (i = 0; i < _keep.size(); i++) {
-                for (j = 0; j <= i; j++) _grm_N(i, j) = grm_N_buf(_keep[i], _keep[j]);
+            MatrixXf grm_N_buf;
+            grm_N_buf.swap(_grm_N);
+            _grm_N.resize(nk, nk);
+            #pragma omp parallel for schedule(dynamic, 32)
+            for (long r = 0; r < nk; r++) {
+                const int kr = _keep[r];
+                for (long c = 0; c <= r; c++) {
+                    const int kc = _keep[c];
+                    const float val = (kr >= kc) ? grm_N_buf(kr, kc) : grm_N_buf(kc, kr);
+                    _grm_N(r, c) = val;
+                    _grm_N(c, r) = val;
+                }
             }
         }
     }
@@ -520,45 +868,188 @@ void gcta::merge_grm(string merge_grm_file) {
     vector<string> grm_files, grm_id;
     read_grm_filenames(merge_grm_file, grm_files);
 
-    int f = 0, i = 0, j = 0;
-    for (f = 0; f < grm_files.size(); f++) {
+    int f = 0, i = 0;
+    for (f = 0; f < (int)grm_files.size(); f++) {
         read_grm(grm_files[f], grm_id, false, true);
         update_id_map_kp(grm_id, _id_map, _keep);
     }
     vector<string> uni_id;
-    for (i = 0; i < _keep.size(); i++) uni_id.push_back(_fid[_keep[i]] + ":" + _pid[_keep[i]]);
+    uni_id.reserve(_keep.size());
+    for (i = 0; i < (int)_keep.size(); i++) uni_id.push_back(_fid[_keep[i]] + ":" + _pid[_keep[i]]);
     _n = uni_id.size();
     if (_n == 0) LOGGER.e(0, "no individual is in common among the GRM files.");
     else LOGGER << _n << " individuals in common in the GRM files." << endl;
 
     vector<int> kp;
-    eigenMatrix grm = eigenMatrix::Zero(_n, _n);
-    eigenMatrix grm_N = eigenMatrix::Zero(_n, _n);
-    for (f = 0; f < grm_files.size(); f++) {
-        LOGGER << "Reading the GRM from the " << f + 1 << "th file ..." << endl;
-        read_grm(grm_files[f], grm_id);
-        StrFunc::match(uni_id, grm_id, kp);
-        for (i = 0; i < _n; i++) {
-            for (j = 0; j <= i; j++) {
-                if (kp[i] >= kp[j]) {
-                    grm(i, j) += _grm(kp[i], kp[j]) * _grm_N(kp[i], kp[j]);
-                    grm_N(i, j) += _grm_N(kp[i], kp[j]);
-                } else {
-                    grm(i, j) += _grm(kp[j], kp[i]) * _grm_N(kp[j], kp[i]);
-                    grm_N(i, j) += _grm_N(kp[j], kp[i]);
+    if (_grm_bin_flag) {
+        _grm.setZero(_n, _n);
+        eigenMatrix grm_N_acc = eigenMatrix::Zero(_n, _n);
+        const long kStripeRows = 256;
+        vector<float> buf_A;
+        vector<float> buf_N;
+        vector<size_t> row_off(kStripeRows + 1, 0);
+
+        for (f = 0; f < (int)grm_files.size(); f++) {
+            LOGGER << "Reading the GRM from the " << f + 1 << "th file ..." << endl;
+            const long nf = static_cast<long>(read_grm_id(grm_files[f], grm_id, true, false));
+            StrFunc::match(uni_id, grm_id, kp);
+
+            bool is_identity = (nf == _n);
+            bool injective = true;
+            vector<int> inv_kp(nf, -1);
+            for (long u = 0; u < _n; u++) {
+                const int src_idx = kp[u];
+                if (src_idx != u) is_identity = false;
+                if (src_idx < 0 || src_idx >= nf || inv_kp[src_idx] != -1) {
+                    injective = false;
+                    is_identity = false;
+                    break;
+                }
+                inv_kp[src_idx] = static_cast<int>(u);
+            }
+
+            if (injective) {
+                string grm_binfile = grm_files[f] + ".grm.bin";
+                string grm_Nfile = grm_files[f] + ".grm.N.bin";
+                FILE *A_bin = fopen(grm_binfile.c_str(), "rb");
+                if (!A_bin) LOGGER.e(0, "cannot open the file [" + grm_binfile + "] to read.");
+                FILE *N_bin = fopen(grm_Nfile.c_str(), "rb");
+                if (!N_bin) {
+                    fclose(A_bin);
+                    LOGGER.e(0, "cannot open the file [" + grm_Nfile + "] to read.");
+                }
+                setvbuf(A_bin, NULL, _IOFBF, 4 * 1024 * 1024);
+                setvbuf(N_bin, NULL, _IOFBF, 4 * 1024 * 1024);
+                LOGGER << "Reading the GRM from [" + grm_binfile + "]." << endl;
+                LOGGER << "Reading the number of SNPs for the GRM from [" + grm_Nfile + "]." << endl;
+
+                const size_t max_stripe = static_cast<size_t>(kStripeRows) * static_cast<size_t>(std::max<long>(1, nf));
+                if (buf_A.size() < max_stripe) {
+                    buf_A.resize(max_stripe);
+                    buf_N.resize(max_stripe);
+                }
+
+                for (long r0 = 0; r0 < nf; r0 += kStripeRows) {
+                    const long r_cnt = std::min<long>(kStripeRows, nf - r0);
+                    row_off[0] = 0;
+                    for (long dr = 0; dr < r_cnt; dr++) {
+                        row_off[dr + 1] = row_off[dr] + static_cast<size_t>(r0 + dr + 1);
+                    }
+                    const size_t n_elems = row_off[r_cnt];
+                    if (n_elems > 0 && fread(buf_A.data(), sizeof(float), n_elems, A_bin) != n_elems) {
+                        fclose(A_bin);
+                        fclose(N_bin);
+                        LOGGER.e(0, "Is the size of the [" + grm_binfile + "] file incorrect?");
+                    }
+                    if (n_elems > 0 && fread(buf_N.data(), sizeof(float), n_elems, N_bin) != n_elems) {
+                        fclose(A_bin);
+                        fclose(N_bin);
+                        LOGGER.e(0, "Is the size of the [" + grm_Nfile + "] file incorrect?");
+                    }
+                    if (is_identity) {
+                        #pragma omp parallel for schedule(static)
+                        for (long dr = 0; dr < r_cnt; dr++) {
+                            const long r = r0 + dr;
+                            const float *srcA = buf_A.data() + row_off[dr];
+                            const float *srcN = buf_N.data() + row_off[dr];
+                            for (long c = 0; c <= r; c++) {
+                                const double vn = static_cast<double>(srcN[c]);
+                                _grm(r, c) += static_cast<double>(srcA[c]) * vn;
+                                grm_N_acc(r, c) += vn;
+                            }
+                        }
+                    } else {
+                        #pragma omp parallel for schedule(static)
+                        for (long dr = 0; dr < r_cnt; dr++) {
+                            const long src_r = r0 + dr;
+                            const int dst_r = inv_kp[src_r];
+                            if (dst_r < 0) continue;
+                            const float *srcA = buf_A.data() + row_off[dr];
+                            const float *srcN = buf_N.data() + row_off[dr];
+                            for (long src_c = 0; src_c <= src_r; src_c++) {
+                                const int dst_c = inv_kp[src_c];
+                                if (dst_c < 0) continue;
+                                const int hi = std::max(dst_r, dst_c);
+                                const int lo = std::min(dst_r, dst_c);
+                                const double vn = static_cast<double>(srcN[src_c]);
+                                _grm(hi, lo) += static_cast<double>(srcA[src_c]) * vn;
+                                grm_N_acc(hi, lo) += vn;
+                            }
+                        }
+                    }
+                }
+                fclose(A_bin);
+                fclose(N_bin);
+                LOGGER << "GRM for " << nf << " individuals are included from [" + grm_binfile + "]." << endl;
+            } else {
+                eigenMatrix cur_acc;
+                cur_acc.swap(_grm);
+                read_grm(grm_files[f], grm_id);
+                #pragma omp parallel for schedule(dynamic, 32)
+                for (long c = 0; c < _n; c++) {
+                    const int kc = kp[c];
+                    for (long r = c; r < _n; r++) {
+                        const int kr = kp[r];
+                        const int hi = std::max(kr, kc);
+                        const int lo = std::min(kr, kc);
+                        const double vn = static_cast<double>(_grm_N(hi, lo));
+                        cur_acc(r, c) += static_cast<double>(_grm(hi, lo)) * vn;
+                        grm_N_acc(r, c) += vn;
+                    }
+                }
+                _grm.swap(cur_acc);
+            }
+        }
+
+        _grm_N.resize(_n, _n);
+        #pragma omp parallel for schedule(dynamic, 32)
+        for (long c = 0; c < _n; c++) {
+            for (long r = c; r < _n; r++) {
+                const double vn = grm_N_acc(r, c);
+                const double val = (vn == 0.0) ? 0.0 : (_grm(r, c) / vn);
+                _grm(r, c) = val;
+                _grm(c, r) = val;
+                const float vnf = static_cast<float>(vn);
+                _grm_N(r, c) = vnf;
+                _grm_N(c, r) = vnf;
+            }
+        }
+        grm_N_acc.resize(0, 0);
+    } else {
+        eigenMatrix grm = eigenMatrix::Zero(_n, _n);
+        eigenMatrix grm_N = eigenMatrix::Zero(_n, _n);
+        for (f = 0; f < (int)grm_files.size(); f++) {
+            LOGGER << "Reading the GRM from the " << f + 1 << "th file ..." << endl;
+            read_grm(grm_files[f], grm_id);
+            StrFunc::match(uni_id, grm_id, kp);
+            #pragma omp parallel for schedule(dynamic, 32)
+            for (long c = 0; c < _n; c++) {
+                const int kc = kp[c];
+                for (long r = c; r < _n; r++) {
+                    const int kr = kp[r];
+                    const int hi = std::max(kr, kc);
+                    const int lo = std::min(kr, kc);
+                    const double vn = static_cast<double>(_grm_N(hi, lo));
+                    grm(r, c) += static_cast<double>(_grm(hi, lo)) * vn;
+                    grm_N(r, c) += vn;
                 }
             }
         }
-    }
-    for (i = 0; i < _n; i++) {
-        for (j = 0; j <= i; j++) {
-            if (grm_N(i, j) == 0) _grm(i, j) = 0;
-            else _grm(i, j) = grm(i, j) / grm_N(i, j);
-            _grm_N(i, j) = grm_N(i, j);
+        _grm.resize(_n, _n);
+        _grm_N.resize(_n, _n);
+        #pragma omp parallel for schedule(dynamic, 32)
+        for (long c = 0; c < _n; c++) {
+            for (long r = c; r < _n; r++) {
+                const double vn = grm_N(r, c);
+                const double val = (vn == 0.0) ? 0.0 : (grm(r, c) / vn);
+                _grm(r, c) = val;
+                _grm(c, r) = val;
+                const float vnf = static_cast<float>(vn);
+                _grm_N(r, c) = vnf;
+                _grm_N(c, r) = vnf;
+            }
         }
     }
-    grm.resize(0, 0);
-    grm_N.resize(0, 0);
     LOGGER << "\n" << grm_files.size() << " GRMs have been merged together." << endl;
 }
 
@@ -566,13 +1057,14 @@ void gcta::align_grm(string m_grm_file) {
     vector<string> grm_files, grm_id;
     read_grm_filenames(m_grm_file, grm_files);
     
-    int f = 0, i = 0, j = 0;
-    for (f = 0; f < grm_files.size(); f++) {
+    int f = 0, i = 0;
+    for (f = 0; f < (int)grm_files.size(); f++) {
         read_grm(grm_files[f], grm_id, false, true);
         update_id_map_kp(grm_id, _id_map, _keep);
     }
     vector<string> uni_id;
-    for (i = 0; i < _keep.size(); i++) uni_id.push_back(_fid[_keep[i]] + ":" + _pid[_keep[i]]);
+    uni_id.reserve(_keep.size());
+    for (i = 0; i < (int)_keep.size(); i++) uni_id.push_back(_fid[_keep[i]] + ":" + _pid[_keep[i]]);
     _n = uni_id.size();
     if (_n == 0) LOGGER.e(0, "no individual is in common among the GRM files.");
     else LOGGER << _n << " individuals are in common among the GRM files." << endl;
@@ -580,32 +1072,29 @@ void gcta::align_grm(string m_grm_file) {
     string _out_save = _out;
     
     vector<int> kp;
-    eigenMatrix grm = eigenMatrix::Zero(_n, _n);
-    eigenMatrix grm_N = eigenMatrix::Zero(_n, _n);
-    for (f = 0; f < grm_files.size(); f++) {
+    eigenMatrix grm(_n, _n);
+    MatrixXf grm_N(_n, _n);
+    for (f = 0; f < (int)grm_files.size(); f++) {
         LOGGER << "Reading the GRM from the " << f + 1 << "th file ..." << endl;
-        grm.setZero(_n, _n);
-        grm_N.setZero(_n, _n);
         read_grm(grm_files[f], grm_id);
         StrFunc::match(uni_id, grm_id, kp);
-        for (i = 0; i < _n; i++) {
-            for (j = 0; j <= i; j++) {
-                if (kp[i] >= kp[j]) {
-                    grm(i, j) = _grm(kp[i], kp[j]) * _grm_N(kp[i], kp[j]);
-                    grm_N(i, j) = _grm_N(kp[i], kp[j]);
-                } else {
-                    grm(i, j) = _grm(kp[j], kp[i]) * _grm_N(kp[j], kp[i]);
-                    grm_N(i, j) = _grm_N(kp[j], kp[i]);
-                }
+        #pragma omp parallel for schedule(dynamic, 32)
+        for (long c = 0; c < _n; c++) {
+            const int kc = kp[c];
+            for (long r = c; r < _n; r++) {
+                const int kr = kp[r];
+                const int hi = std::max(kr, kc);
+                const int lo = std::min(kr, kc);
+                const float vn = _grm_N(hi, lo);
+                const double val = (vn == 0.0f) ? 0.0 : static_cast<double>(_grm(hi, lo));
+                grm(r, c) = val;
+                grm(c, r) = val;
+                grm_N(r, c) = vn;
+                grm_N(c, r) = vn;
             }
         }
-        for (i = 0; i < _n; i++) {
-            for (j = 0; j <= i; j++) {
-                if (grm_N(i, j) == 0) _grm(i, j) = 0;
-                else _grm(i, j) = grm(i, j) / grm_N(i, j);
-                _grm_N(i, j) = grm_N(i, j);
-            }
-        }
+        _grm.swap(grm);
+        _grm_N.swap(grm_N);
         
         _out = grm_files[f] + ".aligned";
         output_grm(true);
