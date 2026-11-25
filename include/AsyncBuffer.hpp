@@ -13,6 +13,7 @@
 */
 #ifndef GCTA2_ASYNCBUFFER_H
 #define GCTA2_ASYNCBUFFER_H
+#include <cstdint>
 #include <mutex>
 #include <condition_variable>
 #include <tuple>

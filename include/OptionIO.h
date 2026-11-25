@@ -16,10 +16,12 @@
 
 #ifndef gcta2_optionio_h
 #define gcta2_optionio_h
-#include <vector>
-#include <string>
-#include <map>
+#include <cstdint>
 #include <cstdio>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #include "Logger.h"
 using std::map;
 using std::vector;

@@ -1,0 +1,15 @@
+.git
+.gitignore
+.gitmodules
+build*
+cmake-build-*
+compile_commands.json
+docker
+docs
+gcta_win64
+test
+submods/plink-ng/.git
+submods/plink-ng/1.9
+submods/plink-ng/2.0/Tests
+submods/plink-ng/2.0/build_dynamic
+submods/plink-ng/2.0/build_win
