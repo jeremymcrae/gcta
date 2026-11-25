@@ -314,6 +314,10 @@ void Geno::setSexMode(){
 bool Geno::filterMAF(){
     if((options_d["min_maf"] != 0.0) || (options_d["max_maf"] != 0.5)){
         LOGGER.i(0, "Computing allele frequencies...");
+        AFA1.assign(this->marker->count_extract(), 0.0);
+        countMarkers.assign(this->marker->count_extract(), 0);
+        num_marker_freq = 0;
+        bFreqFiltered = false;
         vector<function<void (uint64_t *, int)>> callBacks;
         callBacks.push_back(bind(&Geno::freq64, this, _1, _2));
         loop_64block(this->marker->get_extract_index(), callBacks);
@@ -445,7 +449,7 @@ void Geno::init_AsyncBuffer(){
     if(asyncBuffer){
         delete asyncBuffer;
     }
-    asyncBuffer = new AsyncBuffer<uint8_t>(num_byte_buffer);
+    asyncBuffer = new AsyncBuffer<uint8_t>(num_byte_buffer + 8);
 }
 
 
@@ -3160,22 +3164,16 @@ void Geno::bgen2bed(const vector<uint32_t> &raw_marker_index){
 
 
 void Geno::save_bed(uint64_t *buf, int num_marker){
-    static string err_string = "can't write to [" + options["out"] + ".bed].";
-    static bool inited = false;
-    if(!inited){
+    string err_string = "can't write to [" + options["out"] + ".bed].";
+    if(hOut == NULL){
         hOut = fopen((options["out"] + ".bed").c_str(), "wb");
         if(hOut == NULL){
             LOGGER.e(0, err_string);
         }
-        uint8_t * buffer = new uint8_t[3];
-        buffer[0] = 0x6c;
-        buffer[1] = 0x1b;
-        buffer[2] = 0x01;
-        if(3 != fwrite(buffer, sizeof(uint8_t), 3, hOut)){
+        const uint8_t header[3] = {0x6c, 0x1b, 0x01};
+        if(3 != fwrite(header, sizeof(uint8_t), 3, hOut)){
             LOGGER.e(0, err_string);
         }
-        inited = true;
-        delete[] buffer;
     }
 
     uint64_t base_buffer = 0;
@@ -3190,7 +3188,10 @@ void Geno::save_bed(uint64_t *buf, int num_marker){
 }
 
 void Geno::closeOut(){
-    fclose(hOut);
+    if(hOut != NULL){
+        fclose(hOut);
+        hOut = NULL;
+    }
 }
 
 void Geno::resetFreq(){
@@ -3237,7 +3238,7 @@ void Geno::freq64(uint64_t *buf, int num_marker) {
         //countA1A2[raw_index_marker] = curA1A2;
         //countA2A2[raw_index_marker] = curA2A2;
         uint32_t cur_total_markers = (total_markers - 2 * (odd_ct - both_ct));
-        double cur_af = 1.0*(even_ct + both_ct) / cur_total_markers;
+        double cur_af = (cur_total_markers > 0) ? (1.0*(even_ct + both_ct) / cur_total_markers) : 0.0;
         if(!marker->isEffecRev(raw_index_marker)){
             cur_af = 1.0 - cur_af;
         }
@@ -3408,13 +3409,9 @@ void Geno::move_geno(uint8_t *buf, uint64_t *keep_list, uint32_t num_raw_sample,
     }
     */
 
-    static uint32_t num_byte_keep_geno = (num_keep_sample + 3) / 4;
-    static uint32_t num_byte_per_marker = (num_raw_sample + 3) / 4;
-    static uint32_t num_qword_per_marker = (num_byte_keep_geno + 7) / 8;
-
-    static int remain_bit = (num_byte_per_marker % 8) * 8;
-    static int move_bit = 64 - remain_bit;
-    static uint64_t MASK = (UINT64_MAX << move_bit) >> move_bit;
+    const uint32_t num_byte_keep_geno = (num_keep_sample + 3) / 4;
+    const uint32_t num_byte_per_marker = (num_raw_sample + 3) / 4;
+    const uint32_t num_qword_per_marker = (num_byte_keep_geno + 7) / 8;
 
     const int move_markers = 4;
 
@@ -3435,6 +3432,14 @@ void Geno::move_geno(uint8_t *buf, uint64_t *keep_list, uint32_t num_raw_sample,
 }
 
 void Geno::loop_64block(const vector<uint32_t> &raw_marker_index, vector<function<void (uint64_t *buf, int num_marker)>> callbacks, bool showLog) {
+    if(keep_mask == NULL){
+        init_keep();
+    }
+    if(raw_marker_index.empty()){
+        return;
+    }
+    init_AsyncBuffer();
+
     // show log also act as function that 
     if(showLog){
         LOGGER.i(0, "Reading PLINK BED file(s) in SNP-major format...");
@@ -3445,7 +3450,6 @@ void Geno::loop_64block(const vector<uint32_t> &raw_marker_index, vector<functio
     }
     //LOGGER << "DEBUG num_finished_markers: " << num_finished_markers << std::endl;
     thread read_thread([this, &raw_marker_index](){this->read_bed(raw_marker_index);});
-    read_thread.detach();
 
     uint8_t *r_buf = NULL;
     bool isEOF = false;
@@ -3521,6 +3525,7 @@ void Geno::loop_64block(const vector<uint32_t> &raw_marker_index, vector<functio
             }
         }
     }
+    read_thread.join();
     delete[] geno_buf;
     if(showLog){
         std::ostringstream ss;
@@ -4291,8 +4296,12 @@ void Geno::processMain() {
             pheno.save_pheno(filename + ".fam");
             marker.save_marker(filename + ".bim");
             LOGGER.i(0, "Saving genotype to PLINK binary PED format [" + filename + ".bed]...");
-            callBacks.push_back(bind(&Geno::save_bed, &geno, _1, _2));
-            geno.loop_64block(marker.get_extract_index(), callBacks);
+            if(marker.count_extract() == 0){
+                geno.save_bed(NULL, 0);
+            }else{
+                callBacks.push_back(bind(&Geno::save_bed, &geno, _1, _2));
+                geno.loop_64block(marker.get_extract_index(), callBacks);
+            }
             geno.closeOut();
             LOGGER.i(0, "Genotype has been saved.");
         }

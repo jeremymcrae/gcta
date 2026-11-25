@@ -401,6 +401,19 @@ bool Covar::setCovarMapping(bool is_rcovar, vector<vector<string>> *map_order){
     }else{
         err_string = "can't specify inconsistent or single covariate labels.";
     }
+    auto *plabels_covar = &this->labels_covar;
+    auto *pcovar = &this->covar;
+    auto *plabels_covar_mapping = &this->labels_covar_mapping;
+    if(is_rcovar){
+        plabels_covar = &this->labels_rcovar;
+        pcovar = &this->rcovar;
+        plabels_covar_mapping = &this->labels_rcovar_mapping;
+    }
+
+    auto &labels_covar = *plabels_covar;
+    auto &covar = *pcovar;
+    auto &labels_covar_mapping = *plabels_covar_mapping;
+
     if(sample_id.size() == 0 || covar.size() == 0){
         return false;
     }
@@ -414,19 +427,6 @@ bool Covar::setCovarMapping(bool is_rcovar, vector<vector<string>> *map_order){
     int expand_col_covar = 0;
     vector<int> start_col_X;
     start_col_X.push_back(0);
-
-    auto *plabels_covar = &this->labels_covar;
-    auto *pcovar = &this->covar;
-    auto *plabels_covar_mapping = &this->labels_covar_mapping;
-    if(is_rcovar){
-        plabels_covar = &this->labels_rcovar;
-        pcovar = &this->rcovar;
-        plabels_covar_mapping = &this->labels_rcovar_mapping;
-    }
-
-    auto &labels_covar = *plabels_covar;
-    auto &covar = *pcovar;
-    auto &labels_covar_mapping = *plabels_covar_mapping;
 
     for(auto & label : labels_covar){
         expand_col_covar += label["LABEL_MAX_VALUE"];

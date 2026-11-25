@@ -35,6 +35,10 @@ void GBitCountTable::set_count(vector<uint16_t> &indices, uint32_t &A1A1, uint32
 void GBitCountTable::count_geno_init(uint16_t geno8[][4], size_t length){
     uint16_t mask = 0b11;
     for(uint16_t index = 0; index < length; index++){
+        geno8[index][0] = 0;
+        geno8[index][1] = 0;
+        geno8[index][2] = 0;
+        geno8[index][3] = 0;
         for(int bit_shift = 0; bit_shift < 8; bit_shift += 2){
             uint8_t cur_bit = (index >> bit_shift) & mask;
             switch(cur_bit){

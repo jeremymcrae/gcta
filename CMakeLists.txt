@@ -194,12 +194,6 @@ foreach(_lib ${SRCS})
     list(APPEND libs_list ${lib_name})
 endforeach(_lib)
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND TARGET geno)
-    # Upstream src/Geno.cpp has two '#pragma omp ordered' blocks inside one loop,
-    # which Clang's strict OpenMP parser rejects.
-    target_compile_options(geno PRIVATE -fno-openmp -Wno-unknown-pragmas)
-endif()
-
 add_subdirectory(main)
 add_subdirectory(submods)
 

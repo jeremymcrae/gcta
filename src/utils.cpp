@@ -115,8 +115,10 @@ std::string joinPath(const std::string & dir, const std::string & path){
     #endif
     if(dir.empty()){
         return path;
-    }else{
+    }else if(dir.back() == '/' || dir.back() == '\\'){
         return dir + path;
+    }else{
+        return dir + sep + path;
     }
 }
 
