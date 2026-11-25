@@ -1,14 +1,17 @@
-CMAKE_MINIMUM_REQUIRED(VERSION 3.1)
+CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
 SET(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 SET(PROJECT_NAME_STR GCTA2)
 PROJECT(${PROJECT_NAME_STR} C CXX)
 SET(CMAKE_INCLUDE_CURRENT_DIR ON)
-SET(CMAKE_CXX_STANDARD 11)
+if(NOT DEFINED CMAKE_CXX_STANDARD)
+    SET(CMAKE_CXX_STANDARD 14)
+endif()
 SET(CMAKE_C_STANDARD 11)
+
+option(BUILD_TESTING "Build GCTA unit tests" ON)
 
 # get system architecture
 EXECUTE_PROCESS(COMMAND uname -m COMMAND tr -d '\n' OUTPUT_VARIABLE ARCHITECTURE)
-set(CMAKE_LIBRARY_ARCHITECTURE ${ARCHITECTURE})
 
 # fix win stack size issue
 if(WIN32)
@@ -62,22 +65,22 @@ INCLUDE_DIRECTORIES("submods/plink-ng/2.0")
 INCLUDE_DIRECTORIES("submods/plink-ng/2.0/simde")
 
 
-message(STATUS "ARCHITECTURE:${CMAKE_LIBRARY_ARCHITECTURE}")
-if(CMAKE_LIBRARY_ARCHITECTURE STREQUAL "aarch64")
+message(STATUS "ARCHITECTURE:${ARCHITECTURE}")
+if(ARCHITECTURE STREQUAL "aarch64" OR ARCHITECTURE STREQUAL "arm64")
     SET(OPENBLAS "$ENV{OPENBLAS}")
     IF(NOT OPENBLAS)
         MESSAGE(FATAL_ERROR "Specify environment variable OPENBLAS to the location of OPENBLAS package")
     ENDIF()
     INCLUDE_DIRECTORIES("${OPENBLAS}/include")
 
-    find_library(lib_openblas NAMES openblas PATHS "${OPENBLAS}" "${OPENBLAS}/lib")
+    find_library(lib_openblas NAMES openblas openblas.0 blas PATHS "${OPENBLAS}" "${OPENBLAS}/lib" "${OPENBLAS}/lib/aarch64-linux-gnu")
     set(BLAS_LIB ${lib_openblas})
 
     if("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -pthread")
         set(CMAKE_CXX_FLAGS_RELEASE  "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
         set(CMAKE_CXX_FLAGS_DEBUG  "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
-        add_compile_options(-openmp)
+        add_compile_options(-fopenmp)
         set(CMAKE_EXE_LINKER_FLAGS "-Wl,-no_implicit_dylibs")
         if(NOT APPLE)
             # don't delete this it will result in _implibs
@@ -120,7 +123,7 @@ else()
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64 ${SSE} -DMKL_LP64 -pthread")
         set(CMAKE_CXX_FLAGS_RELEASE  "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
         set(CMAKE_CXX_FLAGS_DEBUG  "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
-        add_compile_options(-openmp)
+        add_compile_options(-fopenmp)
         set(CMAKE_EXE_LINKER_FLAGS "-Wl,-no_implicit_dylibs")
         if(NOT APPLE)
             # don't delete this it will result in _implibs
@@ -163,13 +166,19 @@ foreach(_lib ${SRCS})
     list(APPEND libs_list ${lib_name})
 endforeach(_lib)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND TARGET geno)
+    # Upstream src/Geno.cpp has two '#pragma omp ordered' blocks inside one loop,
+    # which Clang's strict OpenMP parser rejects.
+    target_compile_options(geno PRIVATE -fno-openmp -Wno-unknown-pragmas)
+endif()
+
 add_subdirectory(main)
 add_subdirectory(submods)
 
 if(APPLE)
     link_directories(${MKLROOT}/lib)
     link_directories(/usr/local/lib)
-else(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     #linux
     link_directories(${MKLROOT}/../../../lib/intel64)
 endif()
@@ -177,26 +186,22 @@ endif()
 add_executable(gcta64 ${MAIN_SOURCE})
 
 if(APPLE)
-    # iomp5
-    target_link_libraries(gcta64 ${libs_list} Pgenlib mainV1 z ${BLAS_LIB} sqlite3 zstd omp pthread m dl gsl gslcblas) 
+    set(GCTA_SYSTEM_LIBS z ${BLAS_LIB} sqlite3 zstd omp pthread m dl gsl gslcblas)
+    target_link_libraries(gcta64 ${libs_list} Pgenlib mainV1 ${GCTA_SYSTEM_LIBS})
 else()
     if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        # error keeps only
-        #target_link_libraries(gcta64 ${libs_list} mainV1 z ${MKL_LIB} iomp5 pthread m dl )
-        #target_link_libraries(gcta64 mainV1 ${libs_list} z ${MKL_LIB} pthread m dl)
-        # Dynamic link works
-        #target_link_libraries(gcta64 mainV1 ${libs_list} -Wl,-Bstatic z -Wl,--start-group ${MKL_LIB} -Wl,--end-group iomp5 -Wl,-Bdynamic pthread m dl)
-        target_link_libraries(gcta64 mainV1 ${libs_list} Pgenlib z sqlite3 zstd -Wl,--start-group ${BLAS_LIB} -Wl,--end-group iomp5 -Wl,--whole-archive -lpthread -Wl,--no-whole-archive m dl)
+        set(GCTA_SYSTEM_LIBS z sqlite3 zstd gsl gslcblas -Wl,--start-group ${BLAS_LIB} -Wl,--end-group iomp5 -Wl,--whole-archive -lpthread -Wl,--no-whole-archive m dl)
+        target_link_libraries(gcta64 mainV1 ${libs_list} Pgenlib ${GCTA_SYSTEM_LIBS})
     else()
-        #target_link_libraries(gcta64 mainV1 ${libs_list} -Wl,-Bstatic z -Wl,--start-group ${MKL_LIB} -Wl,--end-group gomp -Wl,-Bdynamic pthread m dl)
-        #target_link_libraries(gcta64 mainV1 ${libs_list} Pgenlib -static z sqlite3 zstd -Wl,--start-group ${MKL_LIB} -Wl,--end-group gomp -Wl,--whole-archive -lpthread -Wl,--no-whole-archive m dl)
-        target_link_libraries(gcta64 mainV1 ${libs_list} Pgenlib z sqlite3 zstd gsl gslcblas m -Wl,--start-group ${BLAS_LIB} -Wl,--end-group gomp -Wl,--whole-archive -lpthread -Wl,--no-whole-archive m dl)
+        set(GCTA_SYSTEM_LIBS z sqlite3 zstd gsl gslcblas m -Wl,--start-group ${BLAS_LIB} -Wl,--end-group gomp -Wl,--whole-archive -lpthread -Wl,--no-whole-archive m dl)
+        target_link_libraries(gcta64 mainV1 ${libs_list} Pgenlib ${GCTA_SYSTEM_LIBS})
     endif()
 endif()
 
-# Testing has some problems currently
-#enable_testing()
-#ADD_SUBDIRECTORY(test)
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(test)
+endif()
 
 IF(EXISTS "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json")
   EXECUTE_PROCESS( COMMAND ${CMAKE_COMMAND} -E copy_if_different
