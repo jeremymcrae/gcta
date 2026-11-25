@@ -91,6 +91,11 @@ public:
     //void processFAM();
 
 
+    struct alignas(16) AssocRW {
+        double r;
+        double w;
+    };
+
 private:
     Pheno *pheno;
     Marker *marker;
@@ -222,6 +227,27 @@ private:
 
     void initVar();
     bool bPreciseCovar = false; 
+
+    vector<AssocRW> assocRW;
+    double assocSumR = 0.0;
+    double assocSumW = 0.0;
+    bool assocBinReady = false;
+    bool assocBinPreciseReady = false;
+    MatrixXd assocBinHB;
+    VectorXd assocBinSumHB;
+    VectorXd assocBinCovarTr;
+    MatrixXd assocBinMWX;
+
+    int assocQuantMode = 0; // 0: disabled, 1: no-covar, 2: H orthogonal, 3: general H & X
+    VectorXd assocQuantZ;
+    double assocQuantSumZ = 0.0;
+    MatrixXd assocQuantMXX;
+    VectorXd assocQuantSumH;
+    MatrixXd assocQuantHX;
+    VectorXd assocQuantSumHX;
+
+    void prepareAssocCache();
+    void clearAssocCache();
 
     // gene
     void processFAMreg();

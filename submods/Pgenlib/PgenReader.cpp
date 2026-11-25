@@ -434,6 +434,10 @@ bool PgenReader::CountHardFreqMissExt(uintptr_t *buf, const uintptr_t *subset_it
         const uint32_t raw_sample_ct = rawSampleSize;
         plink2::GenoarrCountSubsetFreqs(buf, subset_iter_vec, raw_sample_ct , keepSize, genocounts);
     }
+    snpinfo->genocounts[0] = genocounts[0];
+    snpinfo->genocounts[1] = genocounts[1];
+    snpinfo->genocounts[2] = genocounts[2];
+    snpinfo->genocounts[3] = genocounts[3];
     snpinfo->N = keepSize - genocounts[3];
     snpinfo->AlCount = 2 * snpinfo->N;
     uint32_t dGenoCounts2 = 2 * genocounts[2];

@@ -50,6 +50,7 @@ typedef struct SNPInfo{
     double mean;
     uint32_t N;
     uint32_t AlCount;
+    uint32_t genocounts[4];
 } SNPInfo;
 
 #define GET_TABLE16(a, b, c, d) PAIR_TABLE16(a, b, c, d)

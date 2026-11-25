@@ -82,10 +82,16 @@ typedef struct GenoBufItem{
     double af;
     double mean;
     double sd; //std^2
-    double info;
+    double info = 1.0;
     uint32_t nValidN;
     uint32_t nValidAllele;
 } GenoBufItem;
+
+struct PackedBedSNP {
+    const uintptr_t *genoVec;
+    uint32_t c0, c1, c2, c3;
+    double a0, a1, a2, na;
+};
 
 
 class Geno {
@@ -136,6 +142,8 @@ public:
     // new loop subset manner
     void preGenoDouble(int numMarkerBuf, bool bMakeGeno, bool bGenoCenter, bool bGenoStd, bool bMakeMiss);
     void getGenoDouble(uintptr_t *buf, int bufIndex, GenoBufItem* gbuf);
+    bool inspectPackedBedSNP(uintptr_t *buf, int bufIndex, GenoBufItem *gbuf, PackedBedSNP *packed);
+    void unpackPackedBedSNP(const PackedBedSNP &packed, GenoBufItem *gbuf);
     void endGenoDouble();
 
     void loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf, bool bMakeGeno, bool bGenoCenter, bool bGenoStd, bool bMakeMiss, vector<function<void (uintptr_t *buf, const vector<uint32_t> &exIndex)>> callbacks = vector<function<void (uintptr_t *buf, const vector<uint32_t> &exIndex)>>(), bool showLog = true);
@@ -291,6 +299,7 @@ private:
     bool bGenoCenter;
     bool bGenoStd;
     bool bMakeMiss;
+    bool bUseBedPackedDouble = false;
     bool bGRM = false;
     bool bGRMDom = false;
     int iGRMdc = -1; // 0 no male dosage comp; 1 full comp; //default value shall be -1, equal variance

@@ -96,6 +96,505 @@ struct ScopedSingleThreadBLAS {
     };
 };
 
+static inline uint32_t ctz_uptr(uintptr_t v) {
+#if defined(_MSC_VER)
+    unsigned long idx;
+#if defined(_WIN64)
+    _BitScanForward64(&idx, v);
+#else
+    _BitScanForward(&idx, v);
+#endif
+    return static_cast<uint32_t>(idx);
+#else
+    return (sizeof(uintptr_t) == 8)
+        ? static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(v)))
+        : static_cast<uint32_t>(__builtin_ctz(static_cast<unsigned int>(v)));
+#endif
+}
+
+static double kahanSum(const double * __restrict ptr, size_t n) {
+    double sum = 0.0;
+    double comp = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double y = ptr[i] - comp;
+        const double t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+static void scorePackedRW(
+    const PackedBedSNP &p,
+    uint32_t n_indi,
+    const FastFAM::AssocRW * __restrict rw,
+    double sum_r_all,
+    double sum_w_all,
+    double &out_score,
+    double &out_wx2
+) {
+    const uint32_t major_is_00 = (p.c0 >= p.c2) ? 1U : 0U;
+    const uint32_t nonmajor = n_indi - (major_is_00 ? p.c0 : p.c2);
+    if (nonmajor <= (n_indi >> 2)) {
+        static constexpr uint32_t kNypsPerWord = static_cast<uint32_t>(sizeof(uintptr_t) * 4);
+        static constexpr uintptr_t kMask55 = (~static_cast<uintptr_t>(0)) / 3U;
+        static constexpr uintptr_t kMaskAA = kMask55 << 1;
+        const uintptr_t major_pat = major_is_00 ? static_cast<uintptr_t>(0) : kMaskAA;
+        const uint32_t full_words = n_indi / kNypsPerWord;
+        const uint32_t rem = n_indi % kNypsPerWord;
+
+        double sr[4] = {0.0, 0.0, 0.0, 0.0};
+        double sw[4] = {0.0, 0.0, 0.0, 0.0};
+        for (uint32_t widx = 0; widx < full_words; ++widx) {
+            const uintptr_t raw_w = p.genoVec[widx];
+            const uintptr_t diff = raw_w ^ major_pat;
+            if (diff == 0) continue;
+            uintptr_t active = (diff | (diff >> 1)) & kMask55;
+            const uint32_t base = widx * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                const uint32_t j = base + (bit >> 1);
+                const uint32_t code = static_cast<uint32_t>((raw_w >> bit) & 3U);
+                sr[code] += rw[j].r;
+                sw[code] += rw[j].w;
+                active &= (active - 1);
+            }
+        }
+        if (rem != 0) {
+            const uintptr_t last_mask = (static_cast<uintptr_t>(1) << (2U * rem)) - 1U;
+            const uintptr_t raw_w = p.genoVec[full_words];
+            const uintptr_t diff = (raw_w ^ major_pat) & last_mask;
+            uintptr_t active = (diff | (diff >> 1)) & kMask55;
+            const uint32_t base = full_words * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                const uint32_t j = base + (bit >> 1);
+                const uint32_t code = static_cast<uint32_t>((raw_w >> bit) & 3U);
+                sr[code] += rw[j].r;
+                sw[code] += rw[j].w;
+                active &= (active - 1);
+            }
+        }
+        if (major_is_00) {
+            const double a02 = p.a0 * p.a0;
+            out_score = p.a0 * sum_r_all + (p.a1 - p.a0) * sr[1] + (p.a2 - p.a0) * sr[2] + (p.na - p.a0) * sr[3];
+            out_wx2   = a02  * sum_w_all + (p.a1 * p.a1 - a02) * sw[1] + (p.a2 * p.a2 - a02) * sw[2] + (p.na * p.na - a02) * sw[3];
+        } else {
+            const double a22 = p.a2 * p.a2;
+            out_score = p.a2 * sum_r_all + (p.a0 - p.a2) * sr[0] + (p.a1 - p.a2) * sr[1] + (p.na - p.a2) * sr[3];
+            out_wx2   = a22  * sum_w_all + (p.a0 * p.a0 - a22) * sw[0] + (p.a1 * p.a1 - a22) * sw[1] + (p.na * p.na - a22) * sw[3];
+        }
+        return;
+    }
+
+    const double tbl_a[4]  = {p.a0, p.a1, p.a2, p.na};
+    const double tbl_a2[4] = {p.a0 * p.a0, p.a1 * p.a1, p.a2 * p.a2, p.na * p.na};
+    const uint8_t * __restrict gbytes = reinterpret_cast<const uint8_t *>(p.genoVec);
+    const uint32_t full_bytes = n_indi >> 2;
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    double v0 = 0.0, v1 = 0.0, v2 = 0.0, v3 = 0.0;
+    for (uint32_t bidx = 0; bidx < full_bytes; ++bidx) {
+        const uint32_t b = gbytes[bidx];
+        const uint32_t c_0 = b & 3U;
+        const uint32_t c_1 = (b >> 2) & 3U;
+        const uint32_t c_2 = (b >> 4) & 3U;
+        const uint32_t c_3 = (b >> 6) & 3U;
+        const FastFAM::AssocRW * __restrict rwp = rw + (bidx << 2);
+        s0 += tbl_a[c_0] * rwp[0].r; v0 += tbl_a2[c_0] * rwp[0].w;
+        s1 += tbl_a[c_1] * rwp[1].r; v1 += tbl_a2[c_1] * rwp[1].w;
+        s2 += tbl_a[c_2] * rwp[2].r; v2 += tbl_a2[c_2] * rwp[2].w;
+        s3 += tbl_a[c_3] * rwp[3].r; v3 += tbl_a2[c_3] * rwp[3].w;
+    }
+    double score = (s0 + s1) + (s2 + s3);
+    double wx2   = (v0 + v1) + (v2 + v3);
+    const uint32_t rem = n_indi & 3U;
+    if (rem != 0) {
+        uint32_t b = gbytes[full_bytes];
+        const uint32_t base = full_bytes << 2;
+        for (uint32_t r = 0; r < rem; ++r) {
+            const uint32_t c = b & 3U;
+            score += tbl_a[c]  * rw[base + r].r;
+            wx2   += tbl_a2[c] * rw[base + r].w;
+            b >>= 2;
+        }
+    }
+    out_score = score;
+    out_wx2   = wx2;
+}
+
+static void scorePackedRWAndMat(
+    const PackedBedSNP &p,
+    uint32_t n_indi,
+    const FastFAM::AssocRW * __restrict rw,
+    double sum_r_all,
+    double sum_w_all,
+    const double * __restrict mat_colmajor,
+    int mat_rows,
+    const double * __restrict sum_mat,
+    double * __restrict out_mat_x,
+    double &out_score,
+    double &out_wx2
+) {
+    const uint32_t major_is_00 = (p.c0 >= p.c2) ? 1U : 0U;
+    const uint32_t nonmajor = n_indi - (major_is_00 ? p.c0 : p.c2);
+    if (nonmajor <= (n_indi >> 2)) {
+        static constexpr uint32_t kNypsPerWord = static_cast<uint32_t>(sizeof(uintptr_t) * 4);
+        static constexpr uintptr_t kMask55 = (~static_cast<uintptr_t>(0)) / 3U;
+        static constexpr uintptr_t kMaskAA = kMask55 << 1;
+        const uintptr_t major_pat = major_is_00 ? static_cast<uintptr_t>(0) : kMaskAA;
+        const uint32_t full_words = n_indi / kNypsPerWord;
+        const uint32_t rem = n_indi % kNypsPerWord;
+
+        double sr[4] = {0.0, 0.0, 0.0, 0.0};
+        double sw[4] = {0.0, 0.0, 0.0, 0.0};
+        double sm[4][128];
+        for (int c = 0; c < 4; ++c) {
+            for (int r = 0; r < mat_rows; ++r) sm[c][r] = 0.0;
+        }
+
+        for (uint32_t widx = 0; widx < full_words; ++widx) {
+            const uintptr_t raw_w = p.genoVec[widx];
+            const uintptr_t diff = raw_w ^ major_pat;
+            if (diff == 0) continue;
+            uintptr_t active = (diff | (diff >> 1)) & kMask55;
+            const uint32_t base = widx * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                const uint32_t j = base + (bit >> 1);
+                const uint32_t code = static_cast<uint32_t>((raw_w >> bit) & 3U);
+                sr[code] += rw[j].r;
+                sw[code] += rw[j].w;
+                const double * __restrict col = mat_colmajor + static_cast<size_t>(j) * mat_rows;
+                double * __restrict dst = sm[code];
+                for (int r = 0; r < mat_rows; ++r) dst[r] += col[r];
+                active &= (active - 1);
+            }
+        }
+        if (rem != 0) {
+            const uintptr_t last_mask = (static_cast<uintptr_t>(1) << (2U * rem)) - 1U;
+            const uintptr_t raw_w = p.genoVec[full_words];
+            const uintptr_t diff = (raw_w ^ major_pat) & last_mask;
+            uintptr_t active = (diff | (diff >> 1)) & kMask55;
+            const uint32_t base = full_words * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                const uint32_t j = base + (bit >> 1);
+                const uint32_t code = static_cast<uint32_t>((raw_w >> bit) & 3U);
+                sr[code] += rw[j].r;
+                sw[code] += rw[j].w;
+                const double * __restrict col = mat_colmajor + static_cast<size_t>(j) * mat_rows;
+                double * __restrict dst = sm[code];
+                for (int r = 0; r < mat_rows; ++r) dst[r] += col[r];
+                active &= (active - 1);
+            }
+        }
+        if (major_is_00) {
+            const double a02 = p.a0 * p.a0;
+            const double d1 = p.a1 - p.a0, d2 = p.a2 - p.a0, d3 = p.na - p.a0;
+            out_score = p.a0 * sum_r_all + d1 * sr[1] + d2 * sr[2] + d3 * sr[3];
+            out_wx2   = a02  * sum_w_all + (p.a1 * p.a1 - a02) * sw[1] + (p.a2 * p.a2 - a02) * sw[2] + (p.na * p.na - a02) * sw[3];
+            for (int r = 0; r < mat_rows; ++r) {
+                out_mat_x[r] = p.a0 * sum_mat[r] + d1 * sm[1][r] + d2 * sm[2][r] + d3 * sm[3][r];
+            }
+        } else {
+            const double a22 = p.a2 * p.a2;
+            const double d0 = p.a0 - p.a2, d1 = p.a1 - p.a2, d3 = p.na - p.a2;
+            out_score = p.a2 * sum_r_all + d0 * sr[0] + d1 * sr[1] + d3 * sr[3];
+            out_wx2   = a22  * sum_w_all + (p.a0 * p.a0 - a22) * sw[0] + (p.a1 * p.a1 - a22) * sw[1] + (p.na * p.na - a22) * sw[3];
+            for (int r = 0; r < mat_rows; ++r) {
+                out_mat_x[r] = p.a2 * sum_mat[r] + d0 * sm[0][r] + d1 * sm[1][r] + d3 * sm[3][r];
+            }
+        }
+        return;
+    }
+
+    const double tbl_a[4]  = {p.a0, p.a1, p.a2, p.na};
+    const double tbl_a2[4] = {p.a0 * p.a0, p.a1 * p.a1, p.a2 * p.a2, p.na * p.na};
+    const uint8_t * __restrict gbytes = reinterpret_cast<const uint8_t *>(p.genoVec);
+    const uint32_t full_bytes = n_indi >> 2;
+    for (int r = 0; r < mat_rows; ++r) out_mat_x[r] = 0.0;
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    double v0 = 0.0, v1 = 0.0, v2 = 0.0, v3 = 0.0;
+    for (uint32_t bidx = 0; bidx < full_bytes; ++bidx) {
+        const uint32_t b = gbytes[bidx];
+        const uint32_t c_0 = b & 3U;
+        const uint32_t c_1 = (b >> 2) & 3U;
+        const uint32_t c_2 = (b >> 4) & 3U;
+        const uint32_t c_3 = (b >> 6) & 3U;
+        const double x0 = tbl_a[c_0], x1 = tbl_a[c_1], x2 = tbl_a[c_2], x3 = tbl_a[c_3];
+        const uint32_t j0 = bidx << 2;
+        const FastFAM::AssocRW * __restrict rwp = rw + j0;
+        s0 += x0 * rwp[0].r; v0 += tbl_a2[c_0] * rwp[0].w;
+        s1 += x1 * rwp[1].r; v1 += tbl_a2[c_1] * rwp[1].w;
+        s2 += x2 * rwp[2].r; v2 += tbl_a2[c_2] * rwp[2].w;
+        s3 += x3 * rwp[3].r; v3 += tbl_a2[c_3] * rwp[3].w;
+        const double * __restrict col0 = mat_colmajor + static_cast<size_t>(j0) * mat_rows;
+        const double * __restrict col1 = col0 + mat_rows;
+        const double * __restrict col2 = col1 + mat_rows;
+        const double * __restrict col3 = col2 + mat_rows;
+        for (int r = 0; r < mat_rows; ++r) {
+            out_mat_x[r] += x0 * col0[r] + x1 * col1[r] + x2 * col2[r] + x3 * col3[r];
+        }
+    }
+    double score = (s0 + s1) + (s2 + s3);
+    double wx2   = (v0 + v1) + (v2 + v3);
+    const uint32_t rem = n_indi & 3U;
+    if (rem != 0) {
+        uint32_t b = gbytes[full_bytes];
+        const uint32_t base = full_bytes << 2;
+        for (uint32_t q = 0; q < rem; ++q) {
+            const uint32_t c = b & 3U;
+            const double x = tbl_a[c];
+            score += x * rw[base + q].r;
+            wx2   += tbl_a2[c] * rw[base + q].w;
+            const double * __restrict col = mat_colmajor + static_cast<size_t>(base + q) * mat_rows;
+            for (int r = 0; r < mat_rows; ++r) out_mat_x[r] += x * col[r];
+            b >>= 2;
+        }
+    }
+    out_score = score;
+    out_wx2   = wx2;
+}
+
+static double dotPackedVec(
+    const PackedBedSNP &p,
+    uint32_t n_indi,
+    const double * __restrict z,
+    double sum_z_all
+) {
+    const uint32_t major_is_00 = (p.c0 >= p.c2) ? 1U : 0U;
+    const uint32_t nonmajor = n_indi - (major_is_00 ? p.c0 : p.c2);
+    if (nonmajor <= (n_indi >> 2)) {
+        static constexpr uint32_t kNypsPerWord = static_cast<uint32_t>(sizeof(uintptr_t) * 4);
+        static constexpr uintptr_t kMask55 = (~static_cast<uintptr_t>(0)) / 3U;
+        static constexpr uintptr_t kMaskAA = kMask55 << 1;
+        const uintptr_t major_pat = major_is_00 ? static_cast<uintptr_t>(0) : kMaskAA;
+        const uint32_t full_words = n_indi / kNypsPerWord;
+        const uint32_t rem = n_indi % kNypsPerWord;
+
+        double sz[4] = {0.0, 0.0, 0.0, 0.0};
+        for (uint32_t widx = 0; widx < full_words; ++widx) {
+            const uintptr_t raw_w = p.genoVec[widx];
+            const uintptr_t diff = raw_w ^ major_pat;
+            if (diff == 0) continue;
+            uintptr_t active = (diff | (diff >> 1)) & kMask55;
+            const uint32_t base = widx * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                const uint32_t j = base + (bit >> 1);
+                const uint32_t code = static_cast<uint32_t>((raw_w >> bit) & 3U);
+                sz[code] += z[j];
+                active &= (active - 1);
+            }
+        }
+        if (rem != 0) {
+            const uintptr_t last_mask = (static_cast<uintptr_t>(1) << (2U * rem)) - 1U;
+            const uintptr_t raw_w = p.genoVec[full_words];
+            const uintptr_t diff = (raw_w ^ major_pat) & last_mask;
+            uintptr_t active = (diff | (diff >> 1)) & kMask55;
+            const uint32_t base = full_words * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                const uint32_t j = base + (bit >> 1);
+                const uint32_t code = static_cast<uint32_t>((raw_w >> bit) & 3U);
+                sz[code] += z[j];
+                active &= (active - 1);
+            }
+        }
+        if (major_is_00) {
+            return p.a0 * sum_z_all + (p.a1 - p.a0) * sz[1] + (p.a2 - p.a0) * sz[2] + (p.na - p.a0) * sz[3];
+        } else {
+            return p.a2 * sum_z_all + (p.a0 - p.a2) * sz[0] + (p.a1 - p.a2) * sz[1] + (p.na - p.a2) * sz[3];
+        }
+    }
+
+    const double tbl_a[4] = {p.a0, p.a1, p.a2, p.na};
+    const uint8_t * __restrict gbytes = reinterpret_cast<const uint8_t *>(p.genoVec);
+    const uint32_t full_bytes = n_indi >> 2;
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    for (uint32_t bidx = 0; bidx < full_bytes; ++bidx) {
+        const uint32_t b = gbytes[bidx];
+        const double * __restrict zp = z + (bidx << 2);
+        s0 += tbl_a[b & 3U]         * zp[0];
+        s1 += tbl_a[(b >> 2) & 3U]  * zp[1];
+        s2 += tbl_a[(b >> 4) & 3U]  * zp[2];
+        s3 += tbl_a[(b >> 6) & 3U]  * zp[3];
+    }
+    double tot = (s0 + s1) + (s2 + s3);
+    const uint32_t rem = n_indi & 3U;
+    if (rem != 0) {
+        uint32_t b = gbytes[full_bytes];
+        const uint32_t base = full_bytes << 2;
+        for (uint32_t q = 0; q < rem; ++q) {
+            tot += tbl_a[b & 3U] * z[base + q];
+            b >>= 2;
+        }
+    }
+    return tot;
+}
+
+static double dotPackedVecAndMat(
+    const PackedBedSNP &p,
+    uint32_t n_indi,
+    const double * __restrict z,
+    double sum_z_all,
+    const double * __restrict mat_colmajor,
+    int mat_rows,
+    const double * __restrict sum_mat,
+    double * __restrict out_mat_x
+) {
+    const uint32_t major_is_00 = (p.c0 >= p.c2) ? 1U : 0U;
+    const uint32_t nonmajor = n_indi - (major_is_00 ? p.c0 : p.c2);
+    if (nonmajor <= (n_indi >> 2)) {
+        static constexpr uint32_t kNypsPerWord = static_cast<uint32_t>(sizeof(uintptr_t) * 4);
+        static constexpr uintptr_t kMask55 = (~static_cast<uintptr_t>(0)) / 3U;
+        static constexpr uintptr_t kMaskAA = kMask55 << 1;
+        const uintptr_t major_pat = major_is_00 ? static_cast<uintptr_t>(0) : kMaskAA;
+        const uint32_t full_words = n_indi / kNypsPerWord;
+        const uint32_t rem = n_indi % kNypsPerWord;
+
+        double sz[4] = {0.0, 0.0, 0.0, 0.0};
+        double sm[4][128];
+        for (int c = 0; c < 4; ++c) {
+            for (int r = 0; r < mat_rows; ++r) sm[c][r] = 0.0;
+        }
+        for (uint32_t widx = 0; widx < full_words; ++widx) {
+            const uintptr_t raw_w = p.genoVec[widx];
+            const uintptr_t diff = raw_w ^ major_pat;
+            if (diff == 0) continue;
+            uintptr_t active = (diff | (diff >> 1)) & kMask55;
+            const uint32_t base = widx * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                const uint32_t j = base + (bit >> 1);
+                const uint32_t code = static_cast<uint32_t>((raw_w >> bit) & 3U);
+                sz[code] += z[j];
+                const double * __restrict col = mat_colmajor + static_cast<size_t>(j) * mat_rows;
+                double * __restrict dst = sm[code];
+                for (int r = 0; r < mat_rows; ++r) dst[r] += col[r];
+                active &= (active - 1);
+            }
+        }
+        if (rem != 0) {
+            const uintptr_t last_mask = (static_cast<uintptr_t>(1) << (2U * rem)) - 1U;
+            const uintptr_t raw_w = p.genoVec[full_words];
+            const uintptr_t diff = (raw_w ^ major_pat) & last_mask;
+            uintptr_t active = (diff | (diff >> 1)) & kMask55;
+            const uint32_t base = full_words * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                const uint32_t j = base + (bit >> 1);
+                const uint32_t code = static_cast<uint32_t>((raw_w >> bit) & 3U);
+                sz[code] += z[j];
+                const double * __restrict col = mat_colmajor + static_cast<size_t>(j) * mat_rows;
+                double * __restrict dst = sm[code];
+                for (int r = 0; r < mat_rows; ++r) dst[r] += col[r];
+                active &= (active - 1);
+            }
+        }
+        if (major_is_00) {
+            const double d1 = p.a1 - p.a0, d2 = p.a2 - p.a0, d3 = p.na - p.a0;
+            for (int r = 0; r < mat_rows; ++r) {
+                out_mat_x[r] = p.a0 * sum_mat[r] + d1 * sm[1][r] + d2 * sm[2][r] + d3 * sm[3][r];
+            }
+            return p.a0 * sum_z_all + d1 * sz[1] + d2 * sz[2] + d3 * sz[3];
+        } else {
+            const double d0 = p.a0 - p.a2, d1 = p.a1 - p.a2, d3 = p.na - p.a2;
+            for (int r = 0; r < mat_rows; ++r) {
+                out_mat_x[r] = p.a2 * sum_mat[r] + d0 * sm[0][r] + d1 * sm[1][r] + d3 * sm[3][r];
+            }
+            return p.a2 * sum_z_all + d0 * sz[0] + d1 * sz[1] + d3 * sz[3];
+        }
+    }
+
+    const double tbl_a[4] = {p.a0, p.a1, p.a2, p.na};
+    const uint8_t * __restrict gbytes = reinterpret_cast<const uint8_t *>(p.genoVec);
+    const uint32_t full_bytes = n_indi >> 2;
+    for (int r = 0; r < mat_rows; ++r) out_mat_x[r] = 0.0;
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    for (uint32_t bidx = 0; bidx < full_bytes; ++bidx) {
+        const uint32_t b = gbytes[bidx];
+        const double x0 = tbl_a[b & 3U];
+        const double x1 = tbl_a[(b >> 2) & 3U];
+        const double x2 = tbl_a[(b >> 4) & 3U];
+        const double x3 = tbl_a[(b >> 6) & 3U];
+        const uint32_t j0 = bidx << 2;
+        const double * __restrict zp = z + j0;
+        s0 += x0 * zp[0];
+        s1 += x1 * zp[1];
+        s2 += x2 * zp[2];
+        s3 += x3 * zp[3];
+        const double * __restrict col0 = mat_colmajor + static_cast<size_t>(j0) * mat_rows;
+        const double * __restrict col1 = col0 + mat_rows;
+        const double * __restrict col2 = col1 + mat_rows;
+        const double * __restrict col3 = col2 + mat_rows;
+        for (int r = 0; r < mat_rows; ++r) {
+            out_mat_x[r] += x0 * col0[r] + x1 * col1[r] + x2 * col2[r] + x3 * col3[r];
+        }
+    }
+    double tot = (s0 + s1) + (s2 + s3);
+    const uint32_t rem = n_indi & 3U;
+    if (rem != 0) {
+        uint32_t b = gbytes[full_bytes];
+        const uint32_t base = full_bytes << 2;
+        for (uint32_t q = 0; q < rem; ++q) {
+            const double x = tbl_a[b & 3U];
+            tot += x * z[base + q];
+            const double * __restrict col = mat_colmajor + static_cast<size_t>(base + q) * mat_rows;
+            for (int r = 0; r < mat_rows; ++r) out_mat_x[r] += x * col[r];
+            b >>= 2;
+        }
+    }
+    return tot;
+}
+
+static void extractPackedIndex0(
+    const PackedBedSNP &p,
+    uint32_t n_indi,
+    double thresh,
+    vector<uint32_t> &index0
+) {
+    index0.clear();
+    if (p.a0 <= thresh && p.a1 > thresh && p.a2 > thresh && p.na > thresh) {
+        index0.reserve(n_indi - p.c0);
+        static constexpr uint32_t kNypsPerWord = static_cast<uint32_t>(sizeof(uintptr_t) * 4);
+        static constexpr uintptr_t kMask55 = (~static_cast<uintptr_t>(0)) / 3U;
+        const uint32_t full_words = n_indi / kNypsPerWord;
+        const uint32_t rem = n_indi % kNypsPerWord;
+        for (uint32_t widx = 0; widx < full_words; ++widx) {
+            const uintptr_t raw_w = p.genoVec[widx];
+            if (raw_w == 0) continue;
+            uintptr_t active = (raw_w | (raw_w >> 1)) & kMask55;
+            const uint32_t base = widx * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                index0.push_back(base + (bit >> 1));
+                active &= (active - 1);
+            }
+        }
+        if (rem != 0) {
+            const uintptr_t last_mask = (static_cast<uintptr_t>(1) << (2U * rem)) - 1U;
+            const uintptr_t raw_w = p.genoVec[full_words] & last_mask;
+            uintptr_t active = (raw_w | (raw_w >> 1)) & kMask55;
+            const uint32_t base = full_words * kNypsPerWord;
+            while (active) {
+                const uint32_t bit = ctz_uptr(active);
+                index0.push_back(base + (bit >> 1));
+                active &= (active - 1);
+            }
+        }
+        return;
+    }
+    const double tbl_a[4] = {p.a0, p.a1, p.a2, p.na};
+    const uint8_t * __restrict gbytes = reinterpret_cast<const uint8_t *>(p.genoVec);
+    for (uint32_t k = 0; k < n_indi; ++k) {
+        const uint32_t code = (gbytes[k >> 2] >> ((k & 3U) << 1)) & 3U;
+        if (tbl_a[code] > thresh) {
+            index0.push_back(k);
+        }
+    }
+}
+
 static MatrixXd parallelAtB(const Ref<const MatrixXd> &A, const Ref<const MatrixXd> &B) {
     const Eigen::Index n_rows = A.rows();
     const Eigen::Index ca = A.cols();
@@ -3993,6 +4492,10 @@ void FastFAM::calculate_gwa(uintptr_t * genobuf, const vector<uint32_t> &markerI
     int num_marker = markerIndex.size();
     vector<uint8_t> isValids(num_marker);
     const double * __restrict y_ptr = phenoVec.data();
+    const double * __restrict z_ptr = assocQuantZ.size() == num_indi ? assocQuantZ.data() : NULL;
+    const double sum_z_all = assocQuantSumZ;
+    const int q_mode = assocQuantMode;
+    const int c_covar = covarFlag ? static_cast<int>(covar.cols()) : 0;
     const uint32_t n_indi = num_indi;
 
     ScopedSingleThreadBLAS blas_guard;
@@ -4000,44 +4503,85 @@ void FastFAM::calculate_gwa(uintptr_t * genobuf, const vector<uint32_t> &markerI
     {
         ScopedSingleThreadBLAS::ThreadLocal tl_guard;
         GenoBufItem item;
-        item.geno.reserve(n_indi);
+        VectorXd x_scratch;
+        double hx_buf[128];
 
         #pragma omp for schedule(dynamic, 16)
         for(int i = 0; i < num_marker; i++){
             uint32_t cur_marker = markerIndex[i];
             item.extractedMarkerIndex = cur_marker;
 
-            geno->getGenoDouble(genobuf, i, &item);
+            double xx = 0.0;
+            double xMat_V_p = 0.0;
+            bool computed = false;
 
-            isValids[i] = item.valid;
-            if(!item.valid) {
-                continue;
+            PackedBedSNP packed;
+            if(q_mode != 0 && geno->inspectPackedBedSNP(genobuf, i, &item, &packed)){
+                isValids[i] = item.valid;
+                if(!item.valid){
+                    continue;
+                }
+                const double raw_xx =
+                    static_cast<double>(packed.c0) * (packed.a0 * packed.a0) +
+                    static_cast<double>(packed.c1) * (packed.a1 * packed.a1) +
+                    static_cast<double>(packed.c2) * (packed.a2 * packed.a2) +
+                    static_cast<double>(packed.c3) * (packed.na * packed.na);
+                if(q_mode == 1){
+                    xx = raw_xx;
+                    xMat_V_p = dotPackedVec(packed, n_indi, z_ptr, sum_z_all);
+                    computed = true;
+                }else if(q_mode == 2){
+                    xMat_V_p = dotPackedVecAndMat(packed, n_indi, z_ptr, sum_z_all, H.data(), c_covar, assocQuantSumH.data(), hx_buf);
+                    Eigen::Map<const VectorXd> u_map(hx_buf, c_covar);
+                    xx = raw_xx - u_map.dot(assocQuantMXX * u_map);
+                    if(xx > 1e-10 * raw_xx){
+                        computed = true;
+                    }
+                }else if(q_mode == 3){
+                    xMat_V_p = dotPackedVecAndMat(packed, n_indi, z_ptr, sum_z_all, assocQuantHX.data(), 2 * c_covar, assocQuantSumHX.data(), hx_buf);
+                    Eigen::Map<const VectorXd> u_map(hx_buf, c_covar);
+                    Eigen::Map<const VectorXd> v_map(hx_buf + c_covar, c_covar);
+                    xx = raw_xx - 2.0 * u_map.dot(v_map) + u_map.dot(assocQuantMXX * u_map);
+                    if(xx > 1e-10 * raw_xx){
+                        computed = true;
+                    }
+                }
+                if(!computed){
+                    geno->unpackPackedBedSNP(packed, &item);
+                }
+            }else{
+                geno->getGenoDouble(genobuf, i, &item);
+                isValids[i] = item.valid;
+                if(!item.valid) {
+                    continue;
+                }
             }
 
-            Map< VectorXd > xMat(item.geno.data(), n_indi);
+            if(!computed){
+                Map< VectorXd > xMat(item.geno.data(), n_indi);
+                conditionCovarReg(xMat);
 
-            conditionCovarReg(xMat);
-
-            const double * __restrict x_ptr = xMat.data();
-            double xx0 = 0.0, xx1 = 0.0, xx2 = 0.0, xx3 = 0.0;
-            double xy0 = 0.0, xy1 = 0.0, xy2 = 0.0, xy3 = 0.0;
-            uint32_t j = 0;
-            for(; j + 3 < n_indi; j += 4){
-                const double x0 = x_ptr[j];
-                const double x1 = x_ptr[j + 1];
-                const double x2 = x_ptr[j + 2];
-                const double x3 = x_ptr[j + 3];
-                xx0 += x0 * x0; xy0 += x0 * y_ptr[j];
-                xx1 += x1 * x1; xy1 += x1 * y_ptr[j + 1];
-                xx2 += x2 * x2; xy2 += x2 * y_ptr[j + 2];
-                xx3 += x3 * x3; xy3 += x3 * y_ptr[j + 3];
-            }
-            double xx = (xx0 + xx1) + (xx2 + xx3);
-            double xMat_V_p = (xy0 + xy1) + (xy2 + xy3);
-            for(; j < n_indi; ++j){
-                const double x0 = x_ptr[j];
-                xx += x0 * x0;
-                xMat_V_p += x0 * y_ptr[j];
+                const double * __restrict x_ptr = xMat.data();
+                double xx0 = 0.0, xx1 = 0.0, xx2 = 0.0, xx3 = 0.0;
+                double xy0 = 0.0, xy1 = 0.0, xy2 = 0.0, xy3 = 0.0;
+                uint32_t j = 0;
+                for(; j + 3 < n_indi; j += 4){
+                    const double x0 = x_ptr[j];
+                    const double x1 = x_ptr[j + 1];
+                    const double x2 = x_ptr[j + 2];
+                    const double x3 = x_ptr[j + 3];
+                    xx0 += x0 * x0; xy0 += x0 * y_ptr[j];
+                    xx1 += x1 * x1; xy1 += x1 * y_ptr[j + 1];
+                    xx2 += x2 * x2; xy2 += x2 * y_ptr[j + 2];
+                    xx3 += x3 * x3; xy3 += x3 * y_ptr[j + 3];
+                }
+                xx = (xx0 + xx1) + (xx2 + xx3);
+                xMat_V_p = (xy0 + xy1) + (xy2 + xy3);
+                for(; j < n_indi; ++j){
+                    const double x0 = x_ptr[j];
+                    xx += x0 * x0;
+                    xMat_V_p += x0 * y_ptr[j];
+                }
             }
 
             double xMat_V_x = 1.0 / xx;
@@ -4558,6 +5102,10 @@ void FastFAM::calculate_grammar(uintptr_t *genobuf, const vector<uint32_t> &mark
     int num_marker = markerIndex.size();
     vector<uint8_t> isValids(num_marker);
     const double * __restrict v_ptr = Vi_y_cinf.data();
+    const double * __restrict z_ptr = assocQuantZ.size() == num_indi ? assocQuantZ.data() : NULL;
+    const double sum_z_all = assocQuantSumZ;
+    const int q_mode = assocQuantMode;
+    const int c_covar = covarFlag ? static_cast<int>(covar.cols()) : 0;
     const uint32_t n_indi = num_indi;
 
     ScopedSingleThreadBLAS blas_guard;
@@ -4565,43 +5113,85 @@ void FastFAM::calculate_grammar(uintptr_t *genobuf, const vector<uint32_t> &mark
     {
         ScopedSingleThreadBLAS::ThreadLocal tl_guard;
         GenoBufItem item;
-        item.geno.reserve(n_indi);
+        double hx_buf[128];
 
         #pragma omp for schedule(dynamic, 16)
         for(int i = 0; i < num_marker; i++){
             uint32_t cur_marker = markerIndex[i];
             item.extractedMarkerIndex = cur_marker;
-            geno->getGenoDouble(genobuf, i, &item);
-            
-            isValids[i] = item.valid;
-            if(!item.valid){
-                continue;
-            }
-            
-            Map< VectorXd > xvec(item.geno.data(), n_indi);
 
-            conditionCovarReg(xvec);
+            double gtg = 0.0;
+            double gt_Vi_y = 0.0;
+            bool computed = false;
 
-            const double * __restrict x_ptr = xvec.data();
-            double gg0 = 0.0, gg1 = 0.0, gg2 = 0.0, gg3 = 0.0;
-            double gv0 = 0.0, gv1 = 0.0, gv2 = 0.0, gv3 = 0.0;
-            uint32_t j = 0;
-            for(; j + 3 < n_indi; j += 4){
-                const double x0 = x_ptr[j];
-                const double x1 = x_ptr[j + 1];
-                const double x2 = x_ptr[j + 2];
-                const double x3 = x_ptr[j + 3];
-                gg0 += x0 * x0; gv0 += x0 * v_ptr[j];
-                gg1 += x1 * x1; gv1 += x1 * v_ptr[j + 1];
-                gg2 += x2 * x2; gv2 += x2 * v_ptr[j + 2];
-                gg3 += x3 * x3; gv3 += x3 * v_ptr[j + 3];
+            PackedBedSNP packed;
+            if(q_mode != 0 && geno->inspectPackedBedSNP(genobuf, i, &item, &packed)){
+                isValids[i] = item.valid;
+                if(!item.valid){
+                    continue;
+                }
+                const double raw_xx =
+                    static_cast<double>(packed.c0) * (packed.a0 * packed.a0) +
+                    static_cast<double>(packed.c1) * (packed.a1 * packed.a1) +
+                    static_cast<double>(packed.c2) * (packed.a2 * packed.a2) +
+                    static_cast<double>(packed.c3) * (packed.na * packed.na);
+                if(q_mode == 1){
+                    gtg = raw_xx;
+                    gt_Vi_y = dotPackedVec(packed, n_indi, z_ptr, sum_z_all);
+                    computed = true;
+                }else if(q_mode == 2){
+                    gt_Vi_y = dotPackedVecAndMat(packed, n_indi, z_ptr, sum_z_all, H.data(), c_covar, assocQuantSumH.data(), hx_buf);
+                    Eigen::Map<const VectorXd> u_map(hx_buf, c_covar);
+                    gtg = raw_xx - u_map.dot(assocQuantMXX * u_map);
+                    if(gtg > 1e-10 * raw_xx){
+                        computed = true;
+                    }
+                }else if(q_mode == 3){
+                    gt_Vi_y = dotPackedVecAndMat(packed, n_indi, z_ptr, sum_z_all, assocQuantHX.data(), 2 * c_covar, assocQuantSumHX.data(), hx_buf);
+                    Eigen::Map<const VectorXd> u_map(hx_buf, c_covar);
+                    Eigen::Map<const VectorXd> v_map(hx_buf + c_covar, c_covar);
+                    gtg = raw_xx - 2.0 * u_map.dot(v_map) + u_map.dot(assocQuantMXX * u_map);
+                    if(gtg > 1e-10 * raw_xx){
+                        computed = true;
+                    }
+                }
+                if(!computed){
+                    geno->unpackPackedBedSNP(packed, &item);
+                }
+            }else{
+                geno->getGenoDouble(genobuf, i, &item);
+                isValids[i] = item.valid;
+                if(!item.valid){
+                    continue;
+                }
             }
-            double gtg = (gg0 + gg1) + (gg2 + gg3);
-            double gt_Vi_y = (gv0 + gv1) + (gv2 + gv3);
-            for(; j < n_indi; ++j){
-                const double x0 = x_ptr[j];
-                gtg += x0 * x0;
-                gt_Vi_y += x0 * v_ptr[j];
+
+            if(!computed){
+                Map< VectorXd > xvec(item.geno.data(), n_indi);
+
+                conditionCovarReg(xvec);
+
+                const double * __restrict x_ptr = xvec.data();
+                double gg0 = 0.0, gg1 = 0.0, gg2 = 0.0, gg3 = 0.0;
+                double gv0 = 0.0, gv1 = 0.0, gv2 = 0.0, gv3 = 0.0;
+                uint32_t j = 0;
+                for(; j + 3 < n_indi; j += 4){
+                    const double x0 = x_ptr[j];
+                    const double x1 = x_ptr[j + 1];
+                    const double x2 = x_ptr[j + 2];
+                    const double x3 = x_ptr[j + 3];
+                    gg0 += x0 * x0; gv0 += x0 * v_ptr[j];
+                    gg1 += x1 * x1; gv1 += x1 * v_ptr[j + 1];
+                    gg2 += x2 * x2; gv2 += x2 * v_ptr[j + 2];
+                    gg3 += x3 * x3; gv3 += x3 * v_ptr[j + 3];
+                }
+                gtg = (gg0 + gg1) + (gg2 + gg3);
+                gt_Vi_y = (gv0 + gv1) + (gv2 + gv3);
+                for(; j < n_indi; ++j){
+                    const double x0 = x_ptr[j];
+                    gtg += x0 * x0;
+                    gt_Vi_y += x0 * v_ptr[j];
+                }
             }
 
             double temp_beta = gt_Vi_y / gtg;
@@ -4637,6 +5227,159 @@ void FastFAM::calculate_mixed_2df_sandwich(uintptr_t *genobuf, const vector<uint
     phenoVec -=VectorXd::Ones(phenoVec.size()) * (phenoVec.mean()) ;
 
     calculate_gwa_2df_sandwich(genobuf, markerIndex);
+}
+
+void FastFAM::prepareAssocCache(){
+    clearAssocCache();
+    if(num_indi == 0){
+        return;
+    }
+    if(bBinary && phenoVecMu.size() == num_indi && dWp.size() == num_indi){
+        assocRW.resize(num_indi);
+        const double * __restrict r_ptr = phenoVecMu.data();
+        const double * __restrict w_ptr = dWp.data();
+        #pragma omp parallel for schedule(static)
+        for(uint32_t j = 0; j < num_indi; ++j){
+            assocRW[j].r = r_ptr[j];
+            assocRW[j].w = w_ptr[j];
+        }
+        assocSumR = kahanSum(r_ptr, num_indi);
+        assocSumW = kahanSum(w_ptr, num_indi);
+        assocBinReady = true;
+
+        if(bPreciseCovar && covarFlag && covar.rows() == num_indi &&
+           H.rows() == covar.cols() && H.cols() == num_indi &&
+           covar.cols() > 0 && covar.cols() <= 64){
+            const int c = static_cast<int>(covar.cols());
+            assocBinHB.resize(2 * c, num_indi);
+            #pragma omp parallel for schedule(static)
+            for(Eigen::Index j = 0; j < static_cast<Eigen::Index>(num_indi); ++j){
+                const double wj = w_ptr[j];
+                for(int r = 0; r < c; ++r){
+                    assocBinHB(r, j)     = H(r, j);
+                    assocBinHB(c + r, j) = wj * covar(j, r);
+                }
+            }
+            assocBinSumHB = VectorXd::Zero(2 * c);
+            for(int r = 0; r < 2 * c; ++r){
+                double s = 0.0, comp = 0.0;
+                for(Eigen::Index j = 0; j < static_cast<Eigen::Index>(num_indi); ++j){
+                    const double y = assocBinHB(r, j) - comp;
+                    const double t = s + y;
+                    comp = (t - s) - y;
+                    s = t;
+                }
+                assocBinSumHB(r) = s;
+            }
+            assocBinCovarTr = covar.transpose() * phenoVecMu;
+            assocBinMWX = MatrixXd::Zero(c, c);
+            const Eigen::Index kTile = 2048;
+            const Eigen::Index n_tiles = (static_cast<Eigen::Index>(num_indi) + kTile - 1) / kTile;
+            vector<MatrixXd> partials(static_cast<size_t>(n_tiles));
+            ScopedSingleThreadBLAS blas_guard;
+            #pragma omp parallel
+            {
+                ScopedSingleThreadBLAS::ThreadLocal tl_guard;
+                #pragma omp for schedule(static)
+                for(Eigen::Index t = 0; t < n_tiles; ++t){
+                    const Eigen::Index r0 = t * kTile;
+                    const Eigen::Index rows = std::min<Eigen::Index>(kTile, static_cast<Eigen::Index>(num_indi) - r0);
+                    partials[static_cast<size_t>(t)] = assocBinHB.bottomRows(c).middleCols(r0, rows) * covar.middleRows(r0, rows);
+                }
+            }
+            for(size_t t = 0; t < partials.size(); ++t){
+                assocBinMWX += partials[t];
+            }
+            assocBinPreciseReady = true;
+        }
+        return;
+    }
+
+    if(!bBinary && !has_envir && !(fam_flag && !bGrammar)){
+        const VectorXd &target = bGrammar ? Vi_y_cinf : phenoVec;
+        if(target.size() != num_indi){
+            return;
+        }
+        if(!covarFlag){
+            assocQuantZ = target;
+            assocQuantSumZ = kahanSum(assocQuantZ.data(), num_indi);
+            assocQuantMode = 1;
+        }else if(covar.rows() == num_indi && H.rows() == covar.cols() && H.cols() == num_indi &&
+                 covar.cols() > 0 && covar.cols() <= 64){
+            const int c = static_cast<int>(covar.cols());
+            assocQuantMXX = parallelAtB(covar, covar);
+            const VectorXd xtz = covar.transpose() * target;
+            assocQuantZ = target - H.transpose() * xtz;
+            assocQuantSumZ = kahanSum(assocQuantZ.data(), num_indi);
+
+            double max_x = 1.0;
+            double max_err = 0.0;
+            const Eigen::Index step = std::max<Eigen::Index>(1, static_cast<Eigen::Index>(num_indi) / 4096);
+            for(Eigen::Index j = 0; j < static_cast<Eigen::Index>(num_indi); j += step){
+                const VectorXd mh = assocQuantMXX * H.col(j);
+                for(int r = 0; r < c; ++r){
+                    const double xjr = covar(j, r);
+                    max_x = std::max(max_x, std::abs(xjr));
+                    max_err = std::max(max_err, std::abs(xjr - mh(r)));
+                }
+            }
+            if(max_err <= 1e-10 * max_x){
+                assocQuantSumH = VectorXd::Zero(c);
+                for(int r = 0; r < c; ++r){
+                    double s = 0.0, comp = 0.0;
+                    for(Eigen::Index j = 0; j < static_cast<Eigen::Index>(num_indi); ++j){
+                        const double y = H(r, j) - comp;
+                        const double t = s + y;
+                        comp = (t - s) - y;
+                        s = t;
+                    }
+                    assocQuantSumH(r) = s;
+                }
+                assocQuantMode = 2;
+            }else{
+                assocQuantHX.resize(2 * c, num_indi);
+                #pragma omp parallel for schedule(static)
+                for(Eigen::Index j = 0; j < static_cast<Eigen::Index>(num_indi); ++j){
+                    for(int r = 0; r < c; ++r){
+                        assocQuantHX(r, j)     = H(r, j);
+                        assocQuantHX(c + r, j) = covar(j, r);
+                    }
+                }
+                assocQuantSumHX = VectorXd::Zero(2 * c);
+                for(int r = 0; r < 2 * c; ++r){
+                    double s = 0.0, comp = 0.0;
+                    for(Eigen::Index j = 0; j < static_cast<Eigen::Index>(num_indi); ++j){
+                        const double y = assocQuantHX(r, j) - comp;
+                        const double t = s + y;
+                        comp = (t - s) - y;
+                        s = t;
+                    }
+                    assocQuantSumHX(r) = s;
+                }
+                assocQuantMode = 3;
+            }
+        }
+    }
+}
+
+void FastFAM::clearAssocCache(){
+    vector<AssocRW>().swap(assocRW);
+    assocSumR = 0.0;
+    assocSumW = 0.0;
+    assocBinReady = false;
+    assocBinPreciseReady = false;
+    assocBinHB.resize(0, 0);
+    assocBinSumHB.resize(0);
+    assocBinCovarTr.resize(0);
+    assocBinMWX.resize(0, 0);
+
+    assocQuantMode = 0;
+    assocQuantZ.resize(0);
+    assocQuantSumZ = 0.0;
+    assocQuantMXX.resize(0, 0);
+    assocQuantSumH.resize(0);
+    assocQuantHX.resize(0, 0);
+    assocQuantSumHX.resize(0);
 }
 
 void FastFAM::processFAM(vector<function<void (uintptr_t *, const vector<uint32_t> &)>> callBacks){
@@ -4735,7 +5478,9 @@ void FastFAM::processFAM(vector<function<void (uintptr_t *, const vector<uint32_
         p_geno = new double[nMarker];
         p_interaction = new double[nMarker];
     }
+    prepareAssocCache();
     geno->loopDouble(extractIndex, nMarker, true, bCenter, false, false, callBacks);
+    clearAssocCache();
 
     osOut.flush();
     osOut.close();
@@ -6715,6 +7460,12 @@ void FastFAM::calculate_spa(uintptr_t *genobuf, const vector<uint32_t> &markerIn
     vector<uint8_t> isValids(num_marker);
     const double * __restrict w_ptr = dWp.data();
     const double * __restrict r_ptr = phenoVecMu.data();
+    const AssocRW * __restrict rw_ptr = assocBinReady ? assocRW.data() : NULL;
+    const double sum_r_all = assocSumR;
+    const double sum_w_all = assocSumW;
+    const bool bin_ready = assocBinReady;
+    const bool bin_precise_ready = assocBinPreciseReady;
+    const int c_covar = covarFlag ? static_cast<int>(covar.cols()) : 0;
     const uint32_t n_indi = num_indi;
 
     ScopedSingleThreadBLAS blas_guard;
@@ -6722,27 +7473,79 @@ void FastFAM::calculate_spa(uintptr_t *genobuf, const vector<uint32_t> &markerIn
     {
         ScopedSingleThreadBLAS::ThreadLocal tl_guard;
         GenoBufItem item;
-        item.geno.reserve(n_indi);
         vector<double> xvec_raw_buf;
-        if(bPreciseCovar){
-            xvec_raw_buf.resize(n_indi);
-        }
         vector<uint32_t> index0;
+        double hb_buf[128];
 
         #pragma omp for schedule(dynamic, 16)
         for(int i = 0; i < num_marker; i++){
             uint32_t cur_marker = markerIndex[i];
             item.extractedMarkerIndex = cur_marker;
-            geno->getGenoDouble(genobuf, i, &item);
-            
-            isValids[i] = item.valid;
-            if(!item.valid){
-                continue;
+
+            PackedBedSNP packed;
+            const bool is_packed = bin_ready && geno->inspectPackedBedSNP(genobuf, i, &item, &packed);
+            if(is_packed){
+                isValids[i] = item.valid;
+                if(!item.valid){
+                    continue;
+                }
+                bool fast_ok = false;
+                double sum_wx2 = 0.0;
+                double score_val = 0.0;
+                if(!bPreciseCovar || !covarFlag){
+                    scorePackedRW(packed, n_indi, rw_ptr, sum_r_all, sum_w_all, score_val, sum_wx2);
+                    fast_ok = (sum_wx2 > 0.0);
+                }else if(bin_precise_ready){
+                    double raw_score = 0.0, raw_wx2 = 0.0;
+                    scorePackedRWAndMat(packed, n_indi, rw_ptr, sum_r_all, sum_w_all, assocBinHB.data(), 2 * c_covar, assocBinSumHB.data(), hb_buf, raw_score, raw_wx2);
+                    Eigen::Map<const VectorXd> u_map(hb_buf, c_covar);
+                    Eigen::Map<const VectorXd> v_map(hb_buf + c_covar, c_covar);
+                    score_val = raw_score - u_map.dot(assocBinCovarTr);
+                    sum_wx2 = raw_wx2 - 2.0 * u_map.dot(v_map) + u_map.dot(assocBinMWX * u_map);
+                    fast_ok = (sum_wx2 > 1e-10 * raw_wx2);
+                }
+
+                if(fast_ok){
+                    double varSNP = std::sqrt(sum_wx2 * c_inf);
+                    SPARes res;
+                    res.score = score_val;
+                    double chisq = std::abs(res.score) / varSNP;
+                    if(chisq < spaCutOff - 1e-5){
+                        res.p = StatLib::pchisqd1(chisq * chisq);
+                        res.p_adj = res.p;
+                        res.bConverge = true;
+
+                        Tscore[i] = (float)res.score;
+                        Tse[i] = (float)varSNP;
+                        p[i] = res.p;
+                        padj[i] = res.p_adj;
+                        rConverge[i] = res.bConverge;
+                        af[i] = (float)item.af;
+                        countMarkers[i] = item.nValidN;
+                        info[i] = item.info;
+                        double temp_beta = res.score / (varSNP * varSNP);
+                        beta[i] = (float)temp_beta;
+                        se[i] = std::abs(temp_beta) / sqrt(StatLib::qchisqd1(res.p_adj));
+                        continue;
+                    }
+                }
+                geno->unpackPackedBedSNP(packed, &item);
+            }else{
+                geno->getGenoDouble(genobuf, i, &item);
+                isValids[i] = item.valid;
+                if(!item.valid){
+                    continue;
+                }
             }
 
             Map< VectorXd > xvec(item.geno.data(), n_indi);
             if(bPreciseCovar){
-                std::memcpy(xvec_raw_buf.data(), item.geno.data(), static_cast<size_t>(n_indi) * sizeof(double));
+                if(!is_packed){
+                    if(xvec_raw_buf.size() < n_indi){
+                        xvec_raw_buf.resize(n_indi);
+                    }
+                    std::memcpy(xvec_raw_buf.data(), item.geno.data(), static_cast<size_t>(n_indi) * sizeof(double));
+                }
                 conditionCovarBinReg(xvec);
             }
 
@@ -6780,12 +7583,16 @@ void FastFAM::calculate_spa(uintptr_t *genobuf, const vector<uint32_t> &markerIn
             if( chisq < spaCutOff){
                 res.p_adj = res.p;
             }else{
-                index0.clear();
-                const double * __restrict raw_ptr = bPreciseCovar ? xvec_raw_buf.data() : xvec.data();
                 double thresh = -item.mean + 1e-6;
-                for(uint32_t k = 0; k < n_indi; k++){
-                    if(raw_ptr[k] > thresh){
-                        index0.push_back(k);
+                if(is_packed){
+                    extractPackedIndex0(packed, n_indi, thresh, index0);
+                }else{
+                    index0.clear();
+                    const double * __restrict raw_ptr = bPreciseCovar ? xvec_raw_buf.data() : xvec.data();
+                    for(uint32_t k = 0; k < n_indi; k++){
+                        if(raw_ptr[k] > thresh){
+                            index0.push_back(k);
+                        }
                     }
                 }
 

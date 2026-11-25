@@ -604,6 +604,7 @@ void Geno::preGenoDouble(int numMarkerBuf, bool bMakeGeno, bool bGenoCenter, boo
     this->bGenoCenter = bGenoCenter;
     this->bGenoStd = bGenoStd;
     this->bMakeMiss = bMakeMiss;
+    this->bUseBedPackedDouble = (getGenoDoubleFuncs[genoFormat] == &Geno::getGenoDouble_bed);
 
     numMarkersReadBlocks.resize(3);
     isMarkersSexXYs.resize(3);
@@ -820,6 +821,79 @@ void Geno::readGeno_pgen(const vector<uint32_t> &extractIndex){
 
 void Geno::getGenoDouble(uintptr_t *buf, int bufIndex, GenoBufItem* gbuf){
     (this->*getGenoDoubleFuncs[genoFormat])(buf, bufIndex, gbuf);
+}
+
+bool Geno::inspectPackedBedSNP(uintptr_t *buf, int idx, GenoBufItem *gbuf, PackedBedSNP *packed){
+    if(!bUseBedPackedDouble || bGRMDom || bMakeMiss || !bMakeGeno){
+        return false;
+    }
+    uint8_t isSexXY = isMarkersSexXYs[curBufferIndex];
+    if(isSexXY == 1){
+        return false;
+    }
+    SNPInfo snpinfo;
+    uintptr_t *cur_buf = buf + idx * bedRawGenoBuf1PtrSize;
+    PgenReader::CountHardFreqMissExt(cur_buf, keepMaskInterPtr, rawSampleCT, keepSampleCT, &snpinfo, f_std);
+
+    uint32_t curExtractIndex = gbuf->extractedMarkerIndex;
+    bool isEffRev = marker->isEffecRev(curExtractIndex);
+    double af = isEffRev ? (1.0 - snpinfo.af) : snpinfo.af;
+    if(bHasPreAF){
+        af = AFA1[curExtractIndex];
+        snpinfo.mean = 2 * af;
+        snpinfo.std = 2 * af * (1.0 - af);
+    }
+    double maf = std::min(af, 1.0 - af);
+    if(maf >= min_maf && maf <= max_maf && snpinfo.nMissRate >= dFilterMiss){
+        gbuf->valid = true;
+        gbuf->af = af;
+        gbuf->nValidN = snpinfo.N;
+        gbuf->nValidAllele = snpinfo.AlCount;
+        gbuf->mean = bGRM ? (2.0 * af) : snpinfo.mean;
+        gbuf->sd = f_std ? snpinfo.std : (gbuf->mean * (1.0 - af));
+        double mu = gbuf->mean;
+        double sd = gbuf->sd;
+        if(sd < 1.0e-50){
+            gbuf->valid = false;
+            return true;
+        }
+        double center_value = bGenoCenter ? mu : 0.0;
+        double rdev = bGenoStd ? sqrt(1.0 / sd) : 1.0;
+        double aa0 = 0.0, aa2 = 2.0;
+        if(isEffRev){
+            aa0 = aa2;
+            aa2 = aa0;
+        }
+        packed->a0 = (aa0 - center_value) * rdev;
+        packed->a1 = (1.0 - center_value) * rdev;
+        packed->a2 = (aa2 - center_value) * rdev;
+        packed->na = (mu - center_value) * rdev;
+        packed->c0 = snpinfo.genocounts[0];
+        packed->c1 = snpinfo.genocounts[1];
+        packed->c2 = snpinfo.genocounts[2];
+        packed->c3 = snpinfo.genocounts[3];
+        if(rawSampleCT == keepSampleCT){
+            packed->genoVec = cur_buf;
+        }else{
+            const size_t subsetWords = static_cast<size_t>(PgenReader::GetGenoBufPtrSize(keepSampleCT));
+            if(gbuf->subsetBuf.size() < subsetWords){
+                gbuf->subsetBuf.resize(subsetWords);
+            }
+            uintptr_t *outPtr = gbuf->subsetBuf.data();
+            PgenReader::ExtractGenoExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, outPtr);
+            plink2::ZeroTrailingNyps(keepSampleCT, outPtr);
+            packed->genoVec = outPtr;
+        }
+        return true;
+    }
+    gbuf->valid = false;
+    return true;
+}
+
+void Geno::unpackPackedBedSNP(const PackedBedSNP &packed, GenoBufItem *gbuf){
+    const double lookup[32] __attribute__ ((aligned (16))) = GET_TABLE16(packed.a0, packed.a1, packed.a2, packed.na);
+    gbuf->geno.resize(keepSampleCT);
+    plink2::GenoarrLookup16x8bx2(packed.genoVec, lookup, keepSampleCT, gbuf->geno.data());
 }
 
 void Geno::setGenoItemSize(uint32_t &genoSize, uint32_t &missSize){
