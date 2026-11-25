@@ -176,7 +176,7 @@ struct FastFAM::BinSparseLDLT {
     typedef SparseMatrix<double, Eigen::ColMajor, int32_t> SpMat32;
     typedef Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrixXd;
 
-    enum : int32_t { kGramTileRows = 256 };
+    static constexpr int32_t kGramTileRows = 256;
 
     struct Workspace {
         vector<double> diag_s;
@@ -811,7 +811,7 @@ struct FastFAM::BinSparseLDLT {
             #pragma omp parallel if(n_s >= 4096)
             {
                 ScopedSingleThreadBLAS::ThreadLocal tl_guard;
-                VectorXd r_tile(kGramTileRows);
+                VectorXd r_tile(static_cast<Eigen::Index>(kGramTileRows));
                 #pragma omp for schedule(static)
                 for (int32_t r0 = 0; r0 < n_s; r0 += kGramTileRows) {
                     const int32_t rows = std::min<int32_t>(kGramTileRows, n_s - r0);
@@ -842,7 +842,7 @@ struct FastFAM::BinSparseLDLT {
                 #pragma omp parallel if(n >= 4096)
                 {
                     ScopedSingleThreadBLAS::ThreadLocal tl_guard;
-                    VectorXd r_tile(kGramTileRows);
+                    VectorXd r_tile(static_cast<Eigen::Index>(kGramTileRows));
                     #pragma omp for schedule(static)
                     for (int32_t r0 = 0; r0 < n; r0 += kGramTileRows) {
                         const int32_t rows = std::min<int32_t>(kGramTileRows, n - r0);
@@ -1018,7 +1018,7 @@ struct FastFAM::BinSparseLDLT {
                 ScopedSingleThreadBLAS::ThreadLocal tl_guard;
                 RowMatrixXd S1_tile(kGramTileRows, c);
                 RowMatrixXd S2_tile(kGramTileRows, c);
-                VectorXd r_tile(kGramTileRows);
+                VectorXd r_tile(static_cast<Eigen::Index>(kGramTileRows));
                 #pragma omp for schedule(static)
                 for (int32_t t = 0; t < n_tiles; ++t) {
                     const int32_t r0 = t * kGramTileRows;
@@ -1071,7 +1071,7 @@ struct FastFAM::BinSparseLDLT {
                 #pragma omp parallel if(n >= 4096)
                 {
                     ScopedSingleThreadBLAS::ThreadLocal tl_guard;
-                    VectorXd r_tile(kGramTileRows);
+                    VectorXd r_tile(static_cast<Eigen::Index>(kGramTileRows));
                     #pragma omp for schedule(static)
                     for (int32_t r0 = 0; r0 < n; r0 += kGramTileRows) {
                         const int32_t rows = std::min<int32_t>(kGramTileRows, n - r0);
@@ -1507,6 +1507,8 @@ struct FastFAM::BinSparseLDLT {
         return (quad_v - proj) / denom;
     }
 };
+
+constexpr int32_t FastFAM::BinSparseLDLT::kGramTileRows;
 
 struct MDLHeader{
     char magic[5];
