@@ -191,6 +191,8 @@ private:
     std::ofstream osOut;
     FILE * bOut = NULL;
     vector<char> osBuf;
+    vector<string> outThreadBufs;
+    vector<char> outBinChunkBuf;
     uint32_t numMarkerOutput = 0;
 
     uint32_t seed;

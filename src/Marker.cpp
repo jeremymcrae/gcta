@@ -1365,6 +1365,40 @@ string Marker::get_marker(int rawindex, bool bflip){ // raw index
 string Marker::getMarkerStrExtract(int extractindex, bool bflip){ // extract index
     return get_marker(getRawIndex(extractindex), bflip);
 }
+
+void Marker::appendMarkerStrExtract(uint32_t extractindex, string &out, bool bflip) const {
+    const uint32_t rawindex = index_extract[extractindex];
+    char numbuf[16];
+    uint32_t v = chr[rawindex];
+    int pos = 16;
+    do {
+        numbuf[--pos] = static_cast<char>('0' + (v % 10U));
+        v /= 10U;
+    } while (v != 0U);
+    out.append(numbuf + pos, static_cast<size_t>(16 - pos));
+    out.push_back('\t');
+    out.append(name[rawindex]);
+    out.push_back('\t');
+
+    v = pd[rawindex];
+    pos = 16;
+    do {
+        numbuf[--pos] = static_cast<char>('0' + (v % 10U));
+        v /= 10U;
+    } while (v != 0U);
+    out.append(numbuf + pos, static_cast<size_t>(16 - pos));
+    out.push_back('\t');
+
+    if (static_cast<bool>(A_rev[rawindex]) ^ bflip) {
+        out.append(a2[rawindex]);
+        out.push_back('\t');
+        out.append(a1[rawindex]);
+    } else {
+        out.append(a1[rawindex]);
+        out.push_back('\t');
+        out.append(a2[rawindex]);
+    }
+}
  
 
 bool Marker::isInExtract(uint32_t index) {

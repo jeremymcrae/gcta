@@ -60,6 +60,7 @@ public:
     bool isEffecRevRaw(uint32_t rawIndex);
     string get_marker(int rawindex, bool bflip=false);
     string getMarkerStrExtract(int extractindex, bool bflip=false);
+    void appendMarkerStrExtract(uint32_t extractindex, string &out, bool bflip=false) const;
     static int registerOption(map<string, vector<string>>& options_in);
     static void processMain();
     static MarkerInfo extractBgenMarkerInfo(FILE *h_bgen, uint64_t &pos);

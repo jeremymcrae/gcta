@@ -2379,6 +2379,44 @@ VectorXd SPA::oneMinusMu;
 VectorXd SPA::dWpVec;
 int SPA::nSample = 0;
 
+static bool matchSampleModelIDs(
+    const vector<string> &sampleIDs,
+    const vector<string> &modelIDs,
+    vector<uint32_t> &id1,
+    vector<uint32_t> &id2
+) {
+    const uint32_t n_sample = static_cast<uint32_t>(sampleIDs.size());
+    const uint32_t n_model = static_cast<uint32_t>(modelIDs.size());
+    id1.clear();
+    id2.clear();
+    if (n_sample >= n_model) {
+        id1.reserve(n_model);
+        uint32_t m = 0;
+        for (uint32_t s = 0; s < n_sample && m < n_model; ++s) {
+            if (sampleIDs[s] == modelIDs[m]) {
+                id1.push_back(s);
+                ++m;
+            }
+        }
+        if (m == n_model) {
+            id2.resize(n_model);
+            std::iota(id2.begin(), id2.end(), 0U);
+            return true;
+        }
+        id1.clear();
+    }
+    vector_commonIndex_sorted1(sampleIDs, modelIDs, id1, id2);
+    if (id2.size() != n_model) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_model; ++i) {
+        if (id2[i] != i) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void FastFAM::loadBinModel(){
         LOGGER << "Loading saved GLM model file prefixed with [" << options["model_file"] << "]..." << std::endl;
         LOGGER << "Note: phenotype, covariates, sparse GRM and association test methods are included in the model file, thus these flags will be ignored." << std::endl;
@@ -2391,7 +2429,7 @@ void FastFAM::loadBinModel(){
         uint32_t sample_keep_geno = pheno->count_keep();
         vector<string> sampleIDs = pheno->get_id(0, sample_keep_geno - 1, "\t");
         vector<uint32_t> id1, id2;
-        vector_commonIndex_sorted1(sampleIDs, modelIDs, id1, id2);
+        const bool id2_identity = matchSampleModelIDs(sampleIDs, modelIDs, id1, id2);
         if(id2.size() != num_indi){
             LOGGER.e(0, "some sample IDs in the saved model file do not exist in the genotype file.");
         }
@@ -2449,46 +2487,61 @@ void FastFAM::loadBinModel(){
         covar.resize(num_indi, covar_col);
         H.resize(covar_col, num_indi);
 
-        double *tempVec = new double[num_indi];
-        if(fread(tempVec, sizeof(double), num_indi, ibin) != num_indi){
-            LOGGER.e(0, "failed to read mu.");
-        }
-        //switch order;
-        for(int i = 0; i < num_indi; i++){
-            mu[i] = tempVec[id2[i]];
-        }
-
-        if(fread(tempVec, sizeof(double), num_indi, ibin) != num_indi){
-            LOGGER.e(0, "failed to read phenotype.");
-        }
-        //switch order;
-        for(int i = 0; i < num_indi; i++){
-            phenoVec[i] = tempVec[id2[i]];
-        }
-        delete[] tempVec;
         uint64_t num_covar_elements = (uint64_t)num_indi * covar_col;
-        double *tempCovar = new double[num_covar_elements];
-        //covariate
-        if(fread(tempCovar, sizeof(double), num_covar_elements, ibin) != num_covar_elements){
-            LOGGER.e(0, "failed to read covariates from the saved model.");
-        }
-        for(uint64_t i = 0; i < covar_col; i++){
-            uint64_t cur_base = i * num_indi;
-            for(uint64_t j = 0; j < num_indi; j++){
-                covar(j, i) = tempCovar[cur_base + id2[j]];
+        if(id2_identity){
+            if(fread(mu.data(), sizeof(double), num_indi, ibin) != num_indi){
+                LOGGER.e(0, "failed to read mu.");
+            }
+            if(fread(phenoVec.data(), sizeof(double), num_indi, ibin) != num_indi){
+                LOGGER.e(0, "failed to read phenotype.");
+            }
+            if(fread(covar.data(), sizeof(double), num_covar_elements, ibin) != num_covar_elements){
+                LOGGER.e(0, "failed to read covariates from the saved model.");
+            }
+            if(fread(H.data(), sizeof(double), num_covar_elements, ibin) != num_covar_elements){
+                LOGGER.e(0, "failed to read H from the saved model.");
+            }
+        }else{
+            vector<double> tempVec(num_indi);
+            if(fread(tempVec.data(), sizeof(double), num_indi, ibin) != num_indi){
+                LOGGER.e(0, "failed to read mu.");
+            }
+            #pragma omp parallel for schedule(static)
+            for(int i = 0; i < static_cast<int>(num_indi); i++){
+                mu[i] = tempVec[id2[i]];
+            }
+
+            if(fread(tempVec.data(), sizeof(double), num_indi, ibin) != num_indi){
+                LOGGER.e(0, "failed to read phenotype.");
+            }
+            #pragma omp parallel for schedule(static)
+            for(int i = 0; i < static_cast<int>(num_indi); i++){
+                phenoVec[i] = tempVec[id2[i]];
+            }
+            vector<double>().swap(tempVec);
+
+            vector<double> tempCovar(num_covar_elements);
+            if(fread(tempCovar.data(), sizeof(double), num_covar_elements, ibin) != num_covar_elements){
+                LOGGER.e(0, "failed to read covariates from the saved model.");
+            }
+            for(uint64_t i = 0; i < covar_col; i++){
+                uint64_t cur_base = i * num_indi;
+                #pragma omp parallel for schedule(static)
+                for(int j = 0; j < static_cast<int>(num_indi); j++){
+                    covar(j, i) = tempCovar[cur_base + id2[j]];
+                }
+            }
+            if(fread(tempCovar.data(), sizeof(double), num_covar_elements, ibin) != num_covar_elements){
+                LOGGER.e(0, "failed to read H from the saved model.");
+            }
+            #pragma omp parallel for schedule(static)
+            for(int i = 0; i < static_cast<int>(num_indi); i++){
+                uint64_t cur_base = static_cast<uint64_t>(id2[i]) * covar_col;
+                for(uint64_t j = 0; j < covar_col; j++){
+                    H(j, i) = tempCovar[cur_base + j];
+                }
             }
         }
-        // H
-        if(fread(tempCovar, sizeof(double), num_covar_elements, ibin) != num_covar_elements){
-            LOGGER.e(0, "failed to read H from the saved model.");
-        }
-        for(uint64_t i = 0; i < num_indi; i++){
-            uint64_t cur_base = id2[i] * covar_col;
-            for(uint64_t j = 0; j < covar_col; j++){
-                H(j, i) = tempCovar[cur_base + j];
-            }
-        }
-        delete[] tempCovar;
 
         initVar();
 
@@ -2509,7 +2562,7 @@ void FastFAM::loadModel(){
         uint32_t sample_keep_geno = pheno->count_keep();
         vector<string> sampleIDs = pheno->get_id(0, sample_keep_geno - 1, "\t");
         vector<uint32_t> id1, id2;
-        vector_commonIndex_sorted1(sampleIDs, modelIDs, id1, id2);
+        const bool id2_identity = matchSampleModelIDs(sampleIDs, modelIDs, id1, id2);
         if(id2.size() != num_indi){
             LOGGER.e(0, "Some sample IDs in the saved model file do not exist in genotype file!");
         }
@@ -2555,7 +2608,6 @@ void FastFAM::loadModel(){
         // read the phenotype
         LOGGER << "  loading phenotypes..." << std::endl;
         double *phenoP;
-        double *tempP = new double[num_indi];
         if (has_envir){
             Vi_y.resize(num_indi);
             phenoP = Vi_y.data();
@@ -2567,63 +2619,87 @@ void FastFAM::loadModel(){
             phenoP = Vi_y_cinf.data();
         }
         fseek(ibin, head.phenoVec_start, SEEK_SET);
-        if(fread(tempP, sizeof(double), num_indi, ibin) != num_indi){
-            LOGGER.e(0, "failed to read phenotype from the saved model.");
+        if(id2_identity){
+            if(fread(phenoP, sizeof(double), num_indi, ibin) != num_indi){
+                LOGGER.e(0, "failed to read phenotype from the saved model.");
+            }
+        }else{
+            vector<double> tempP(num_indi);
+            if(fread(tempP.data(), sizeof(double), num_indi, ibin) != num_indi){
+                LOGGER.e(0, "failed to read phenotype from the saved model.");
+            }
+            #pragma omp parallel for schedule(static)
+            for(int i = 0; i < static_cast<int>(num_indi); i++){
+                phenoP[i] = tempP[id2[i]];
+            }
         }
-        // switch order;
-        for(int i = 0; i < num_indi; i++){
-            phenoP[i] = tempP[id2[i]];
-        }
-        delete[] tempP;
 
         // read covariates
         LOGGER << "  loading covariates..." << std::endl;
         uint64_t num_covar_elements = (uint64_t)num_indi * head.covarVec_cols;
         fseek(ibin, head.covarVec_start, SEEK_SET);
         this->covar.resize(num_indi, head.covarVec_cols);
-        double *tempCovar = new double[num_covar_elements];
-        if(fread(tempCovar, sizeof(double), num_covar_elements, ibin) != num_covar_elements){
-            LOGGER.e(0, "failed to read covariates from the saved model.");
-        }
-        for(uint64_t i = 0; i < head.covarVec_cols; i++){
-            uint64_t cur_base = i * num_indi;
-            for(uint64_t j = 0; j < num_indi; j++){
-                covar(j, i) = tempCovar[cur_base + id2[j]];
+        if(id2_identity){
+            if(fread(this->covar.data(), sizeof(double), num_covar_elements, ibin) != num_covar_elements){
+                LOGGER.e(0, "failed to read covariates from the saved model.");
             }
-        }
-
-        if(covarFlag){
-            LOGGER << "  loading " << head.covarVec_cols << " covariates..." << std::endl;
-            //TODO  H seems incorrect;
-            H.resize(num_indi, head.covarVec_cols);
-            if(fread(tempCovar, sizeof(double), num_covar_elements, ibin) != num_covar_elements){
+            if(covarFlag){
+                LOGGER << "  loading " << head.covarVec_cols << " covariates..." << std::endl;
+                H.resize(num_indi, head.covarVec_cols);
+                if(fread(H.data(), sizeof(double), num_covar_elements, ibin) != num_covar_elements){
+                    LOGGER.e(0, "failed to read covariates from the saved model.");
+                }
+            }
+        }else{
+            vector<double> tempCovar(num_covar_elements);
+            if(fread(tempCovar.data(), sizeof(double), num_covar_elements, ibin) != num_covar_elements){
                 LOGGER.e(0, "failed to read covariates from the saved model.");
             }
             for(uint64_t i = 0; i < head.covarVec_cols; i++){
                 uint64_t cur_base = i * num_indi;
-                for(uint64_t j = 0; j < num_indi; j++){
-                    H(j, i) = tempCovar[cur_base + id2[j]];
+                #pragma omp parallel for schedule(static)
+                for(int j = 0; j < static_cast<int>(num_indi); j++){
+                    covar(j, i) = tempCovar[cur_base + id2[j]];
+                }
+            }
+
+            if(covarFlag){
+                LOGGER << "  loading " << head.covarVec_cols << " covariates..." << std::endl;
+                //TODO  H seems incorrect;
+                H.resize(num_indi, head.covarVec_cols);
+                if(fread(tempCovar.data(), sizeof(double), num_covar_elements, ibin) != num_covar_elements){
+                    LOGGER.e(0, "failed to read covariates from the saved model.");
+                }
+                for(uint64_t i = 0; i < head.covarVec_cols; i++){
+                    uint64_t cur_base = i * num_indi;
+                    #pragma omp parallel for schedule(static)
+                    for(int j = 0; j < static_cast<int>(num_indi); j++){
+                        H(j, i) = tempCovar[cur_base + id2[j]];
+                    }
                 }
             }
         }
-        delete[] tempCovar;
 
         //read the environment variable
         if (has_envir){
             LOGGER << "  loading the environment variable..." << std::endl;
-            double *envirE;
-            double *tempE = new double[num_indi];
             envirVec_scaled.resize(num_indi);
-            envirE = envirVec_scaled.data();
+            double *envirE = envirVec_scaled.data();
             fseek(ibin, head.envirVec_start, SEEK_SET);
-            if(fread(tempE, sizeof(double), num_indi, ibin) != num_indi){
-                LOGGER.e(0, "failed to read the environment variable from the saved model.");
+            if(id2_identity){
+                if(fread(envirE, sizeof(double), num_indi, ibin) != num_indi){
+                    LOGGER.e(0, "failed to read the environment variable from the saved model.");
+                }
+            }else{
+                vector<double> tempE(num_indi);
+                if(fread(tempE.data(), sizeof(double), num_indi, ibin) != num_indi){
+                    LOGGER.e(0, "failed to read the environment variable from the saved model.");
+                }
+                #pragma omp parallel for schedule(static)
+                for(int i = 0; i < static_cast<int>(num_indi); i++){
+                    envirE[i] = tempE[id2[i]];
+                }
             }
-            // switch order;
-            for(int i = 0; i < num_indi; i++){
-                envirE[i] = tempE[id2[i]];
-            }
-            delete[] tempE;
         }
 
         if(fam_flag && (!bGrammar)){
@@ -4932,65 +5008,164 @@ void FastFAM::calculate_gwa_2df_sandwich(uintptr_t * genobuf, const vector<uint3
     output_res_2df(isValids, markerIndex);
 }
 
+static inline void appendTabUInt32(string &out, uint32_t v) {
+    char buf[16];
+    int pos = 16;
+    do {
+        buf[--pos] = static_cast<char>('0' + (v % 10U));
+        v /= 10U;
+    } while (v != 0U);
+    buf[--pos] = '\t';
+    out.append(buf + pos, static_cast<size_t>(16 - pos));
+}
+
+static inline void appendTabReal(string &out, double val) {
+    out.push_back('\t');
+    if (std::isnan(val)) {
+        out.append("nan", 3);
+        return;
+    }
+    if (std::isinf(val)) {
+        if (val < 0.0) out.append("-inf", 4);
+        else out.append("inf", 3);
+        return;
+    }
+    char buf[32];
+    const int n = std::snprintf(buf, sizeof(buf), "%.6g", val);
+    if (n > 0) {
+        out.append(buf, static_cast<size_t>(n));
+    }
+}
+
 void FastFAM::output_res_spa(const vector<uint8_t> &isValids, const vector<uint32_t> markerIndex){
     int numKept = 0;
     int num_marker = markerIndex.size();
+    if(num_marker == 0){
+        return;
+    }
     if(bSaveBin){
-        int num_write = 1;
+        if(outThreadBufs.empty()) outThreadBufs.resize(1);
+        string &sbuf = outThreadBufs[0];
+        sbuf.clear();
+        sbuf.reserve(static_cast<size_t>(num_marker) * 40);
+        const size_t rec_bytes = 32 + (hasInfo ? 4 : 0);
+        if(outBinChunkBuf.capacity() < static_cast<size_t>(num_marker) * rec_bytes){
+            outBinChunkBuf.reserve(static_cast<size_t>(num_marker) * rec_bytes);
+        }
+        outBinChunkBuf.resize(static_cast<size_t>(num_marker) * rec_bytes);
+        char *dst = outBinChunkBuf.data();
+
         for(int i = 0; i != num_marker; i++){
             if(isValids[i]){
                 numKept++;
-                osOut << marker->getMarkerStrExtract(markerIndex[i]) << "\n";
-                if(fwrite(&af[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write allele frequency to [" + sFileName + ".bin].");
-                }
+                marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                sbuf.push_back('\n');
 
-                if(fwrite(&beta[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write beta to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&se[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write se to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&p[i], sizeof(double), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write p to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&padj[i], sizeof(double), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write Padj to [" + sFileName + ".bin].");
-                }
-
-                if(fwrite(&countMarkers[i], sizeof(uint32_t), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write N to [" + sFileName + ".bin].");
-                }
+                std::memcpy(dst,      &af[i],           4);
+                std::memcpy(dst + 4,  &beta[i],         4);
+                std::memcpy(dst + 8,  &se[i],           4);
+                std::memcpy(dst + 12, &p[i],            8);
+                std::memcpy(dst + 20, &padj[i],         8);
+                std::memcpy(dst + 28, &countMarkers[i], 4);
                 if(hasInfo){
-                    if(fwrite(&info[i], sizeof(float), num_write, bOut) != num_write){
-                        LOGGER.e(0, "can't write INFO score to [" + sFileName + ".bin].");
-                    }
+                    std::memcpy(dst + 32, &info[i], 4);
                 }
-
-
+                dst += rec_bytes;
+            }
+        }
+        if(!sbuf.empty()){
+            osOut.write(sbuf.data(), static_cast<std::streamsize>(sbuf.size()));
+        }
+        const size_t total_bytes = static_cast<size_t>(dst - outBinChunkBuf.data());
+        if(total_bytes > 0){
+            if(fwrite(outBinChunkBuf.data(), 1, total_bytes, bOut) != total_bytes){
+                LOGGER.e(0, "can't write binary results to [" + sFileName + ".bin].");
             }
         }
     }else{
-        for(int i = 0; i != num_marker; i++){
-            if(isValids[i]){
-                numKept++;
-                osOut << marker->getMarkerStrExtract(markerIndex[i]) << "\t" << countMarkers[i]
-                    << "\t" << af[i] << "\t" << Tscore[i] << "\t" << Tse[i] << "\t" << p[i] 
-                    << "\t" << beta[i] << "\t" << se[i] << "\t" << padj[i] << "\t" << ((int)rConverge[i]);
-                if(hasInfo){
-                    osOut << "\t" << info[i];
-                }
-                osOut << "\n";
-            }else{
-                if(bOutResAll){
+        const int max_t = omp_get_max_threads();
+        const int n_threads = std::max(1, std::min(max_t, (num_marker + 63) / 64));
+        if(static_cast<int>(outThreadBufs.size()) < n_threads){
+            outThreadBufs.resize(n_threads);
+        }
+        if(n_threads == 1){
+            string &sbuf = outThreadBufs[0];
+            sbuf.clear();
+            sbuf.reserve(static_cast<size_t>(num_marker) * 112);
+            for(int i = 0; i < num_marker; ++i){
+                if(isValids[i]){
                     numKept++;
-                osOut << marker->getMarkerStrExtract(markerIndex[i]) << "\t" << countMarkers[i]
-                    << "\t" << af[i] << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA";
-                if(hasInfo){
-                    osOut << "\t" << info[i];
+                    marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                    appendTabUInt32(sbuf, countMarkers[i]);
+                    appendTabReal(sbuf, af[i]);
+                    appendTabReal(sbuf, Tscore[i]);
+                    appendTabReal(sbuf, Tse[i]);
+                    appendTabReal(sbuf, p[i]);
+                    appendTabReal(sbuf, beta[i]);
+                    appendTabReal(sbuf, se[i]);
+                    appendTabReal(sbuf, padj[i]);
+                    appendTabUInt32(sbuf, static_cast<uint32_t>(rConverge[i]));
+                    if(hasInfo){
+                        appendTabReal(sbuf, info[i]);
+                    }
+                    sbuf.push_back('\n');
+                }else if(bOutResAll){
+                    numKept++;
+                    marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                    appendTabUInt32(sbuf, countMarkers[i]);
+                    appendTabReal(sbuf, af[i]);
+                    sbuf.append("\tNA\tNA\tNA\tNA\tNA\tNA\tNA", 21);
+                    if(hasInfo){
+                        appendTabReal(sbuf, info[i]);
+                    }
+                    sbuf.push_back('\n');
                 }
-                osOut << "\n";
- 
+            }
+            if(!sbuf.empty()){
+                osOut.write(sbuf.data(), static_cast<std::streamsize>(sbuf.size()));
+            }
+        }else{
+            #pragma omp parallel num_threads(n_threads) reduction(+:numKept)
+            {
+                const int tid = omp_get_thread_num();
+                const int start = (num_marker * tid) / n_threads;
+                const int end   = (num_marker * (tid + 1)) / n_threads;
+                string &sbuf = outThreadBufs[tid];
+                sbuf.clear();
+                sbuf.reserve(static_cast<size_t>(end - start) * 112);
+                for(int i = start; i < end; ++i){
+                    if(isValids[i]){
+                        numKept++;
+                        marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                        appendTabUInt32(sbuf, countMarkers[i]);
+                        appendTabReal(sbuf, af[i]);
+                        appendTabReal(sbuf, Tscore[i]);
+                        appendTabReal(sbuf, Tse[i]);
+                        appendTabReal(sbuf, p[i]);
+                        appendTabReal(sbuf, beta[i]);
+                        appendTabReal(sbuf, se[i]);
+                        appendTabReal(sbuf, padj[i]);
+                        appendTabUInt32(sbuf, static_cast<uint32_t>(rConverge[i]));
+                        if(hasInfo){
+                            appendTabReal(sbuf, info[i]);
+                        }
+                        sbuf.push_back('\n');
+                    }else if(bOutResAll){
+                        numKept++;
+                        marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                        appendTabUInt32(sbuf, countMarkers[i]);
+                        appendTabReal(sbuf, af[i]);
+                        sbuf.append("\tNA\tNA\tNA\tNA\tNA\tNA\tNA", 21);
+                        if(hasInfo){
+                            appendTabReal(sbuf, info[i]);
+                        }
+                        sbuf.push_back('\n');
+                    }
+                }
+            }
+            for(int t = 0; t < n_threads; ++t){
+                if(!outThreadBufs[t].empty()){
+                    osOut.write(outThreadBufs[t].data(), static_cast<std::streamsize>(outThreadBufs[t].size()));
                 }
             }
         }
@@ -5004,58 +5179,123 @@ void FastFAM::output_res_spa(const vector<uint8_t> &isValids, const vector<uint3
 void FastFAM::output_res(const vector<uint8_t> &isValids, const vector<uint32_t> markerIndex){
     int numKept = 0;
     int num_marker = markerIndex.size();
+    if(num_marker == 0){
+        return;
+    }
     if(bSaveBin){
-        int num_write = 1;
+        if(outThreadBufs.empty()) outThreadBufs.resize(1);
+        string &sbuf = outThreadBufs[0];
+        sbuf.clear();
+        sbuf.reserve(static_cast<size_t>(num_marker) * 40);
+        const size_t rec_bytes = 24 + (hasInfo ? 4 : 0);
+        if(outBinChunkBuf.capacity() < static_cast<size_t>(num_marker) * rec_bytes){
+            outBinChunkBuf.reserve(static_cast<size_t>(num_marker) * rec_bytes);
+        }
+        outBinChunkBuf.resize(static_cast<size_t>(num_marker) * rec_bytes);
+        char *dst = outBinChunkBuf.data();
+
         for(int i = 0; i != num_marker; i++){
             if(isValids[i]){
                 numKept++;
-                osOut << marker->getMarkerStrExtract(markerIndex[i]) << "\n";
-                if(fwrite(&af[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write allele frequency to [" + sFileName + ".bin].");
-                }
+                marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                sbuf.push_back('\n');
 
-                if(fwrite(&beta[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write beta to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&se[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write se to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&p[i], sizeof(double), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write p to [" + sFileName + ".bin].");
-                }
-
-                if(fwrite(&countMarkers[i], sizeof(uint32_t), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write N to [" + sFileName + ".bin].");
-                }
+                std::memcpy(dst,      &af[i],           4);
+                std::memcpy(dst + 4,  &beta[i],         4);
+                std::memcpy(dst + 8,  &se[i],           4);
+                std::memcpy(dst + 12, &p[i],            8);
+                std::memcpy(dst + 20, &countMarkers[i], 4);
                 if(hasInfo){
-                    if(fwrite(&info[i], sizeof(float), num_write, bOut) != num_write){
-                        LOGGER.e(0, "can't write INFO score to [" + sFileName + ".bin].");
-                    }
+                    std::memcpy(dst + 24, &info[i], 4);
                 }
-
-
+                dst += rec_bytes;
+            }
+        }
+        if(!sbuf.empty()){
+            osOut.write(sbuf.data(), static_cast<std::streamsize>(sbuf.size()));
+        }
+        const size_t total_bytes = static_cast<size_t>(dst - outBinChunkBuf.data());
+        if(total_bytes > 0){
+            if(fwrite(outBinChunkBuf.data(), 1, total_bytes, bOut) != total_bytes){
+                LOGGER.e(0, "can't write binary results to [" + sFileName + ".bin].");
             }
         }
     }else{
-        for(int i = 0; i != num_marker; i++){
-            if(isValids[i]){
-                numKept++;
-                osOut << marker->getMarkerStrExtract(markerIndex[i]) << "\t" << countMarkers[i]
-                    << "\t" << af[i] << "\t" << beta[i] << "\t" << se[i] << "\t" << p[i];
-                if(hasInfo){
-                    osOut << "\t" << info[i];
-                }
-                osOut << "\n";
-            }else{
-                if(bOutResAll){
+        const int max_t = omp_get_max_threads();
+        const int n_threads = std::max(1, std::min(max_t, (num_marker + 63) / 64));
+        if(static_cast<int>(outThreadBufs.size()) < n_threads){
+            outThreadBufs.resize(n_threads);
+        }
+        if(n_threads == 1){
+            string &sbuf = outThreadBufs[0];
+            sbuf.clear();
+            sbuf.reserve(static_cast<size_t>(num_marker) * 80);
+            for(int i = 0; i < num_marker; ++i){
+                if(isValids[i]){
                     numKept++;
-                osOut << marker->getMarkerStrExtract(markerIndex[i]) << "\t" << countMarkers[i]
-                    << "\t" << af[i] << "\tNA\tNA\tNA";
-                if(hasInfo){
-                    osOut << "\t" << info[i];
+                    marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                    appendTabUInt32(sbuf, countMarkers[i]);
+                    appendTabReal(sbuf, af[i]);
+                    appendTabReal(sbuf, beta[i]);
+                    appendTabReal(sbuf, se[i]);
+                    appendTabReal(sbuf, p[i]);
+                    if(hasInfo){
+                        appendTabReal(sbuf, info[i]);
+                    }
+                    sbuf.push_back('\n');
+                }else if(bOutResAll){
+                    numKept++;
+                    marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                    appendTabUInt32(sbuf, countMarkers[i]);
+                    appendTabReal(sbuf, af[i]);
+                    sbuf.append("\tNA\tNA\tNA", 9);
+                    if(hasInfo){
+                        appendTabReal(sbuf, info[i]);
+                    }
+                    sbuf.push_back('\n');
                 }
-                osOut << "\n";
- 
+            }
+            if(!sbuf.empty()){
+                osOut.write(sbuf.data(), static_cast<std::streamsize>(sbuf.size()));
+            }
+        }else{
+            #pragma omp parallel num_threads(n_threads) reduction(+:numKept)
+            {
+                const int tid = omp_get_thread_num();
+                const int start = (num_marker * tid) / n_threads;
+                const int end   = (num_marker * (tid + 1)) / n_threads;
+                string &sbuf = outThreadBufs[tid];
+                sbuf.clear();
+                sbuf.reserve(static_cast<size_t>(end - start) * 80);
+                for(int i = start; i < end; ++i){
+                    if(isValids[i]){
+                        numKept++;
+                        marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                        appendTabUInt32(sbuf, countMarkers[i]);
+                        appendTabReal(sbuf, af[i]);
+                        appendTabReal(sbuf, beta[i]);
+                        appendTabReal(sbuf, se[i]);
+                        appendTabReal(sbuf, p[i]);
+                        if(hasInfo){
+                            appendTabReal(sbuf, info[i]);
+                        }
+                        sbuf.push_back('\n');
+                    }else if(bOutResAll){
+                        numKept++;
+                        marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                        appendTabUInt32(sbuf, countMarkers[i]);
+                        appendTabReal(sbuf, af[i]);
+                        sbuf.append("\tNA\tNA\tNA", 9);
+                        if(hasInfo){
+                            appendTabReal(sbuf, info[i]);
+                        }
+                        sbuf.push_back('\n');
+                    }
+                }
+            }
+            for(int t = 0; t < n_threads; ++t){
+                if(!outThreadBufs[t].empty()){
+                    osOut.write(outThreadBufs[t].data(), static_cast<std::streamsize>(outThreadBufs[t].size()));
                 }
             }
         }
@@ -5068,83 +5308,106 @@ void FastFAM::output_res(const vector<uint8_t> &isValids, const vector<uint32_t>
 void FastFAM::output_res_2df(const vector<uint8_t> &isValids, const vector<uint32_t> markerIndex){
     int numKept = 0;
     int num_marker = markerIndex.size();
+    if(num_marker == 0){
+        return;
+    }
     if(bSaveBin){
-        int num_write = 1;
+        if(outThreadBufs.empty()) outThreadBufs.resize(1);
+        string &sbuf = outThreadBufs[0];
+        sbuf.clear();
+        sbuf.reserve(static_cast<size_t>(num_marker) * 40);
+        const size_t rec_bytes = 64 + (hasInfo ? 4 : 0);
+        if(outBinChunkBuf.capacity() < static_cast<size_t>(num_marker) * rec_bytes){
+            outBinChunkBuf.reserve(static_cast<size_t>(num_marker) * rec_bytes);
+        }
+        outBinChunkBuf.resize(static_cast<size_t>(num_marker) * rec_bytes);
+        char *dst = outBinChunkBuf.data();
+
         for(int i = 0; i != num_marker; i++){
             if(isValids[i]){
                 numKept++;
-                osOut << marker->getMarkerStrExtract(markerIndex[i]) << "\n";
-                if(fwrite(&af[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write allele frequency to [" + sFileName + ".bin].");
-                }
+                marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                sbuf.push_back('\n');
 
-                if(fwrite(&beta_geno[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write beta_geno to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&beta_interaction[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write beta_interaction to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&se_geno[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write se_geno to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&se_interaction[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write se_interaction to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&cov_geno_interaction[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write cov_geno_interaction to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&score_geno[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write score_geno to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&score_interaction[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write score_interaction to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&score[i], sizeof(float), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write score to [" + sFileName + ".bin].");
-                }
-                if(fwrite(&p_geno[i], sizeof(double), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write p_geno to [" + sFileName + ".bin].");
-                }   
-                if(fwrite(&p_interaction[i], sizeof(double), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write p_interaction to [" + sFileName + ".bin].");
-                }                             
-                if(fwrite(&p[i], sizeof(double), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write p to [" + sFileName + ".bin].");
-                }
-
-                if(fwrite(&countMarkers[i], sizeof(uint32_t), num_write, bOut) != num_write){
-                    LOGGER.e(0, "can't write N to [" + sFileName + ".bin].");
-                }
+                std::memcpy(dst,      &af[i],                   4);
+                std::memcpy(dst + 4,  &beta_geno[i],            4);
+                std::memcpy(dst + 8,  &beta_interaction[i],     4);
+                std::memcpy(dst + 12, &se_geno[i],              4);
+                std::memcpy(dst + 16, &se_interaction[i],       4);
+                std::memcpy(dst + 20, &cov_geno_interaction[i], 4);
+                std::memcpy(dst + 24, &score_geno[i],           4);
+                std::memcpy(dst + 28, &score_interaction[i],    4);
+                std::memcpy(dst + 32, &score[i],                4);
+                std::memcpy(dst + 36, &p_geno[i],               8);
+                std::memcpy(dst + 44, &p_interaction[i],        8);
+                std::memcpy(dst + 52, &p[i],                    8);
+                std::memcpy(dst + 60, &countMarkers[i],         4);
                 if(hasInfo){
-                    if(fwrite(&info[i], sizeof(float), num_write, bOut) != num_write){
-                        LOGGER.e(0, "can't write INFO score to [" + sFileName + ".bin].");
-                    }
+                    std::memcpy(dst + 64, &info[i], 4);
                 }
-
-
+                dst += rec_bytes;
+            }
+        }
+        if(!sbuf.empty()){
+            osOut.write(sbuf.data(), static_cast<std::streamsize>(sbuf.size()));
+        }
+        const size_t total_bytes = static_cast<size_t>(dst - outBinChunkBuf.data());
+        if(total_bytes > 0){
+            if(fwrite(outBinChunkBuf.data(), 1, total_bytes, bOut) != total_bytes){
+                LOGGER.e(0, "can't write binary results to [" + sFileName + ".bin].");
             }
         }
     }else{
-        for(int i = 0; i != num_marker; i++){
-            if(isValids[i]){
-                numKept++;
-                osOut << marker->getMarkerStrExtract(markerIndex[i]) << "\t" << countMarkers[i]
-                    << "\t" << af[i] << "\t" << beta_geno[i] << "\t" << beta_interaction[i]  << "\t" << se_geno[i] << "\t" << se_interaction[i] << "\t" << cov_geno_interaction[i] << "\t" << score_geno[i] << "\t" << score_interaction[i] << "\t" << score[i] << "\t" << p_geno[i] << "\t" << p_interaction[i] << "\t" << p[i];
-                if(hasInfo){
-                    osOut << "\t" << info[i];
-                }
-                osOut << "\n";
-            }else{
-                if(bOutResAll){
+        const int max_t = omp_get_max_threads();
+        const int n_threads = std::max(1, std::min(max_t, (num_marker + 63) / 64));
+        if(static_cast<int>(outThreadBufs.size()) < n_threads){
+            outThreadBufs.resize(n_threads);
+        }
+        #pragma omp parallel num_threads(n_threads) reduction(+:numKept)
+        {
+            const int tid = omp_get_thread_num();
+            const int start = (num_marker * tid) / n_threads;
+            const int end   = (num_marker * (tid + 1)) / n_threads;
+            string &sbuf = outThreadBufs[tid];
+            sbuf.clear();
+            sbuf.reserve(static_cast<size_t>(end - start) * 160);
+            for(int i = start; i < end; ++i){
+                if(isValids[i]){
                     numKept++;
-                osOut << marker->getMarkerStrExtract(markerIndex[i]) << "\t" << countMarkers[i]
-                    << "\t" << af[i] << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA";
-                if(hasInfo){
-                    osOut << "\t" << info[i];
+                    marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                    appendTabUInt32(sbuf, countMarkers[i]);
+                    appendTabReal(sbuf, af[i]);
+                    appendTabReal(sbuf, beta_geno[i]);
+                    appendTabReal(sbuf, beta_interaction[i]);
+                    appendTabReal(sbuf, se_geno[i]);
+                    appendTabReal(sbuf, se_interaction[i]);
+                    appendTabReal(sbuf, cov_geno_interaction[i]);
+                    appendTabReal(sbuf, score_geno[i]);
+                    appendTabReal(sbuf, score_interaction[i]);
+                    appendTabReal(sbuf, score[i]);
+                    appendTabReal(sbuf, p_geno[i]);
+                    appendTabReal(sbuf, p_interaction[i]);
+                    appendTabReal(sbuf, p[i]);
+                    if(hasInfo){
+                        appendTabReal(sbuf, info[i]);
+                    }
+                    sbuf.push_back('\n');
+                }else if(bOutResAll){
+                    numKept++;
+                    marker->appendMarkerStrExtract(markerIndex[i], sbuf);
+                    appendTabUInt32(sbuf, countMarkers[i]);
+                    appendTabReal(sbuf, af[i]);
+                    sbuf.append("\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA", 33);
+                    if(hasInfo){
+                        appendTabReal(sbuf, info[i]);
+                    }
+                    sbuf.push_back('\n');
                 }
-                osOut << "\n";
- 
-                }
+            }
+        }
+        for(int t = 0; t < n_threads; ++t){
+            if(!outThreadBufs[t].empty()){
+                osOut.write(outThreadBufs[t].data(), static_cast<std::streamsize>(outThreadBufs[t].size()));
             }
         }
     }
