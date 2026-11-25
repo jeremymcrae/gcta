@@ -107,7 +107,7 @@ class PgenReader {
 
         void ExtractGeno(const uintptr_t *in, uintptr_t *out);
         static void ExtractGenoExt(const uintptr_t *in, const uintptr_t * subsets, uint32_t rawSampleSize, uint32_t keepSize, uintptr_t *out);
-        static void ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const double *gtable, double *gOut, uintptr_t *missOut);
+        static void ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const double *gtable, double *gOut, uintptr_t *missOut, uintptr_t *subsetScratch = NULL);
 
         /*
 

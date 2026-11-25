@@ -980,7 +980,15 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     gbuf->missing.resize(missPtrSize); 
                     pmiss = gbuf->missing.data();
                 }
-                PgenReader::ExtractDoubleExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, lookup, gbuf->geno.data(), pmiss); 
+                uintptr_t *subsetScratch = NULL;
+                if(rawSampleCT != keepSampleCT){
+                    const size_t subsetWords = static_cast<size_t>(PgenReader::GetGenoBufPtrSize(keepSampleCT));
+                    if(gbuf->subsetBuf.size() < subsetWords){
+                        gbuf->subsetBuf.resize(subsetWords);
+                    }
+                    subsetScratch = gbuf->subsetBuf.data();
+                }
+                PgenReader::ExtractDoubleExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, lookup, gbuf->geno.data(), pmiss, subsetScratch); 
                 // adjust for chr X;
                 if(isSexXY == 1){
                     /* don't set to missing
@@ -1151,38 +1159,43 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
         curbuf += sizeof(len_decomp);
     }
 
-    string error_promp = to_string(gbuf->extractedMarkerIndex) + "th SNP of [" + geno_files[fileIndex] + "]."; 
+    auto make_error_promp = [&]() -> string {
+        return to_string(gbuf->extractedMarkerIndex) + "th SNP of [" + geno_files[fileIndex] + "].";
+    };
     uint8_t *dec_data;
     if(compressFormat != 0){
-        dec_data = new uint8_t[len_decomp + 8];
+        if(gbuf->bgenDecBuf.size() < static_cast<size_t>(len_decomp) + 8){
+            gbuf->bgenDecBuf.resize(static_cast<size_t>(len_decomp) + 8);
+        }
+        dec_data = gbuf->bgenDecBuf.data();
         uint32_t curCompSize = len_comp;
         if(compressFormat == 1){
             uint32_t Ldecomp = len_decomp;
             int z_result = uncompress((Bytef*)dec_data, (uLongf*)&Ldecomp, (Bytef*)curbuf, curCompSize);
             if(z_result != Z_OK || len_decomp != Ldecomp){
-                LOGGER.e(0, "decompressing genotype data error in " + error_promp); 
+                LOGGER.e(0, "decompressing genotype data error in " + make_error_promp()); 
             }
         }else if(compressFormat == 2){
             //zstd  
             uint64_t const rSize = ZSTD_getFrameContentSize((void*)curbuf, curCompSize);
             switch(rSize){
                 case ZSTD_CONTENTSIZE_ERROR:
-                    LOGGER.e(0, "not compressed by zstd in " + error_promp);
+                    LOGGER.e(0, "not compressed by zstd in " + make_error_promp());
                     break;
                 case ZSTD_CONTENTSIZE_UNKNOWN:
-                    LOGGER.e(0, "original size unknown in " + error_promp);
+                    LOGGER.e(0, "original size unknown in " + make_error_promp());
                     break;
             }
             if(rSize != len_decomp){
-                LOGGER.e(0, "size stated in the compressed file is different from " + error_promp);
+                LOGGER.e(0, "size stated in the compressed file is different from " + make_error_promp());
             }
             size_t const dSize = ZSTD_decompress((void *)dec_data, len_decomp, (void*)curbuf, curCompSize); 
 
             if(ZSTD_isError(dSize)){
-                LOGGER.e(0, "decompressing genotype error: " + string(ZSTD_getErrorName(dSize)) + " in " + error_promp);
+                LOGGER.e(0, "decompressing genotype error: " + string(ZSTD_getErrorName(dSize)) + " in " + make_error_promp());
             }
         }else{
-            LOGGER.e(0, "unknown compress format in " + error_promp);
+            LOGGER.e(0, "unknown compress format in " + make_error_promp());
         }
     }else{
         dec_data = curbuf;
@@ -1190,11 +1203,11 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
 
     uint32_t n_sample = *(uint32_t *)dec_data;
     if(n_sample != rawCountSamples[fileIndex]){
-        LOGGER.e(0, "inconsistent number of individuals in " + error_promp);
+        LOGGER.e(0, "inconsistent number of individuals in " + make_error_promp());
     }
     uint16_t num_alleles = *(uint16_t *)(dec_data + 4);
     if(num_alleles != 2){
-        LOGGER.e(0, "multi-allelic SNPs detected in " + error_promp);
+        LOGGER.e(0, "multi-allelic SNPs detected in " + make_error_promp());
     }
 
     uint8_t min_ploidy = *(uint8_t *)(dec_data + 6);//2
@@ -1202,7 +1215,7 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
     uint8_t * sample_ploidy = (uint8_t *)(dec_data + 8);
     //check all ploidy are 2 or not
     if(min_ploidy != 2){
-        LOGGER.e(0, "multiploidy detected in " + error_promp);
+        LOGGER.e(0, "multiploidy detected in " + make_error_promp());
     }
 
     uint8_t *geno_prob = sample_ploidy + n_sample;
@@ -1218,7 +1231,8 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
     }
 
     uint8_t double_bits_prob = bits_prob * 2;
-    vector<uint32_t> miss_index;
+    vector<uint32_t> &miss_index = gbuf->bgenMissIndex;
+    miss_index.clear();
 
     uint8_t isSexXY = isMarkersSexXYs[curBufferIndex];
 
@@ -1226,7 +1240,8 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
     uint64_t dosage_sum = 0, fij_sum = 0, dosage2_sum = 0;
     uint32_t validN = 0;
     uint32_t validAllele = 0;
-    vector<uint32_t> dosages(keepSampleCT);
+    vector<uint32_t> &dosages = gbuf->bgenDosages;
+    dosages.resize(keepSampleCT);
     uint32_t max_dos = mask * 2 + 1;
     bool has_miss = false;
 
@@ -1270,7 +1285,7 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
             validN++;
             validAllele += 2;
         }else{
-            LOGGER.e(0, "multiploidy detected in " + error_promp);
+            LOGGER.e(0, "multiploidy detected in " + make_error_promp());
         }
     }
 
@@ -1307,11 +1322,6 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                 validAllele--;
             }
         }
-    }
-
-
-    if(compressFormat != 0){
-        delete[] dec_data;
     }
 
 
@@ -1371,7 +1381,10 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     return;
                 }
 
-                double* dos_lookup = new double[max_dos + 2];
+                if(gbuf->bgenDosLookup.size() < static_cast<size_t>(max_dos) + 2){
+                    gbuf->bgenDosLookup.resize(static_cast<size_t>(max_dos) + 2);
+                }
+                double* dos_lookup = gbuf->bgenDosLookup.data();
                 double center_value = 0.0;
                 double rdev = 1.0;
                 if(!bGRMDom){
@@ -1423,7 +1436,6 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                 for(int j = 0; j < curSampleCT; j++){
                     gbuf->geno[j] = dos_lookup[dosages[j]];
                 }
-                delete[] dos_lookup;
                 // adjust for chr X;
                 if(isSexXY == 1){
                     double weight;
@@ -1498,7 +1510,6 @@ void Geno::loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf, bo
    
     preGenoDouble(numMarkerBuf, bMakeGeno, bGenoCenter, bGenoStd, bMakeMiss);
     thread read_thread([this, &extractIndex](){this->readGeno(extractIndex);});
-    read_thread.detach();
     // main loop
     
     LOGGER.ts("LOOP_GENO_PRE");
@@ -1557,6 +1568,9 @@ void Geno::loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf, bo
         ss << std::fixed << std::setprecision(1) << "100% finished in " << LOGGER.tp("LOOP_GENO_TOT") << " sec";
         LOGGER.i(1, ss.str());
         LOGGER << nFinishedMarker << " SNPs have been processed." << std::endl;
+    }
+    if(read_thread.joinable()){
+        read_thread.join();
     }
     endGenoDouble();
 }
@@ -2796,7 +2810,7 @@ void Geno::bgen2bed(const vector<uint32_t> &raw_marker_index){
         uint32_t len_comp, len_decomp;
         char * snp_data;
 
-        #pragma omp ordered
+        #pragma omp critical
         {
             fseek(h_bgen, byte_pos, SEEK_SET);
             len_comp = read1Byte<uint32_t>(h_bgen) - 4;

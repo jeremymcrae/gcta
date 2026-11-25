@@ -545,14 +545,18 @@ void PgenReader::ExtractGenoExt(const uintptr_t *in, const uintptr_t * subsets, 
     plink2::CopyNyparrNonemptySubset(in, subsets, rawSampleSize, keepSize, out);
 }
 
-void PgenReader::ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const double *gtable, double *gOut, uintptr_t *missOut){
+void PgenReader::ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const double *gtable, double *gOut, uintptr_t *missOut, uintptr_t *subsetScratch){
     uintptr_t *bufptr = NULL;
     bool newBuf = false;
     if(rawSampleSize == keepSize){
         bufptr = in;
     }else{
-        newBuf = true;
-        bufptr = new uintptr_t[GetGenoBufPtrSize(keepSize)];
+        if(subsetScratch != NULL){
+            bufptr = subsetScratch;
+        }else{
+            newBuf = true;
+            bufptr = new uintptr_t[GetGenoBufPtrSize(keepSize)];
+        }
         ExtractGenoExt(in, subsets, rawSampleSize, keepSize, bufptr);
     }
     plink2::GenoarrLookup16x8bx2(bufptr, gtable, keepSize, gOut);

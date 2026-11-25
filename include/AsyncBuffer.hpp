@@ -61,66 +61,66 @@ public:
     }
 
     T* start_write(){
-        uint8_t curBufferWrite = m_stat.nextBufferWrite;
-        if(m_stat.accessed[curBufferWrite] &&
-                m_stat.write_count[curBufferWrite] == 0 &&
-                m_stat.read_count[curBufferWrite] == 0 &&
-                (!m_stat.eof[curBufferWrite])){
-            m_stat.write_count[curBufferWrite] += 1;
-            m_stat.accessed[curBufferWrite] = false;
-
-            return buffer[curBufferWrite];
-        }else{
-            std::unique_lock<std::mutex> lock(wmut);
-            wcv.wait_for(lock, std::chrono::milliseconds(20000));
-            lock.unlock();
-
-            return start_write();
-        }
+        std::unique_lock<std::mutex> lock(mut);
+        wcv.wait(lock, [this]() {
+            const uint8_t cur = m_stat.nextBufferWrite;
+            return m_stat.accessed[cur] &&
+                   m_stat.write_count[cur] == 0 &&
+                   m_stat.read_count[cur] == 0 &&
+                   (!m_stat.eof[cur]);
+        });
+        const uint8_t curBufferWrite = m_stat.nextBufferWrite;
+        m_stat.write_count[curBufferWrite] += 1;
+        m_stat.accessed[curBufferWrite] = false;
+        return buffer[curBufferWrite];
     }
 
     /*set current buffer to EOF
      * Please don't call this if the stream to read is not end;
     */
     void setEOF(){
+        std::lock_guard<std::mutex> lock(mut);
         m_stat.eof[m_stat.nextBufferWrite] = true;
     }
 
     void end_write(){
-        uint8_t curBufferWrite = m_stat.nextBufferWrite;
-        m_stat.write_count[curBufferWrite] -= 1;
-        if(!m_stat.eof[curBufferWrite]){
-            m_stat.nextBufferWrite = (curBufferWrite + 1) % 3;
+        {
+            std::lock_guard<std::mutex> lock(mut);
+            const uint8_t curBufferWrite = m_stat.nextBufferWrite;
+            m_stat.write_count[curBufferWrite] -= 1;
+            if(!m_stat.eof[curBufferWrite]){
+                m_stat.nextBufferWrite = (curBufferWrite + 1) % 3;
+            }
         }
         rcv.notify_one();
     }
 
     tuple<T*, bool> start_read(){
-        uint8_t curBufferRead = m_stat.nextBufferRead;
-        if(m_stat.write_count[curBufferRead] == 0 && !m_stat.accessed[curBufferRead]){
-            m_stat.read_count[curBufferRead] += 1;
-            return tuple<T*, bool>{buffer[curBufferRead], m_stat.eof[curBufferRead]};
-        }else{
-            std::unique_lock<std::mutex> lock(rmut);
-            rcv.wait_for(lock, std::chrono::milliseconds(5000));
-            lock.unlock();
-            
-            return start_read();
-        }
+        std::unique_lock<std::mutex> lock(mut);
+        rcv.wait(lock, [this]() {
+            const uint8_t cur = m_stat.nextBufferRead;
+            return m_stat.write_count[cur] == 0 && !m_stat.accessed[cur];
+        });
+        const uint8_t curBufferRead = m_stat.nextBufferRead;
+        m_stat.read_count[curBufferRead] += 1;
+        return tuple<T*, bool>{buffer[curBufferRead], m_stat.eof[curBufferRead]};
     }
 
     void end_read(){
-        uint8_t curBufferRead = m_stat.nextBufferRead;
-        m_stat.read_count[curBufferRead] -= 1;
-        if((m_stat.read_count[curBufferRead] == 0) && (!m_stat.eof[curBufferRead])){
-            m_stat.nextBufferRead = (curBufferRead + 1) % 3;
-            m_stat.accessed[curBufferRead] = true;
+        {
+            std::lock_guard<std::mutex> lock(mut);
+            const uint8_t curBufferRead = m_stat.nextBufferRead;
+            m_stat.read_count[curBufferRead] -= 1;
+            if((m_stat.read_count[curBufferRead] == 0) && (!m_stat.eof[curBufferRead])){
+                m_stat.nextBufferRead = (curBufferRead + 1) % 3;
+                m_stat.accessed[curBufferRead] = true;
+            }
         }
         wcv.notify_one();
     }
 
 private:
-    mutex rmut, wmut;
+    mutex mut;
     BufferStat m_stat;
     condition_variable rcv, wcv;
     T* buffer[3];

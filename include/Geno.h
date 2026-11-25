@@ -74,6 +74,11 @@ typedef struct GenoBufItem{
     uint8_t isSexXY;   // 0: no, 1: X, 2: Y
     vector<double> geno;
     vector<uintptr_t> missing;
+    vector<uintptr_t> subsetBuf;
+    vector<uint8_t> bgenDecBuf;
+    vector<uint32_t> bgenDosages;
+    vector<uint32_t> bgenMissIndex;
+    vector<double> bgenDosLookup;
     double af;
     double mean;
     double sd; //std^2
